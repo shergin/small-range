@@ -1,0 +1,23 @@
+[package]
+name = "small_range"
+version = "1.0.0"
+edition = "2021"
+authors = ["Valentin Shergin"]
+description = "A compact range type: 50% smaller than Range<T> with zero-cost Option"
+license = "MIT"
+repository = "https://github.com/shergin/small-range"
+documentation = "https://docs.rs/small_range"
+readme = "README.md"
+keywords = ["range", "compact", "memory", "niche"]
+categories = ["data-structures", "memory-management", "no-std"]
+
+[dependencies]
+num-traits = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+proptest = "1.0"
+criterion = "0.5"
+
+[[bench]]
+name = "range_comparison"
+harness = false
