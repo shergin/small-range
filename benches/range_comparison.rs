@@ -3,8 +3,9 @@
 //! This benchmark demonstrates the performance benefits of SmallRange
 //! when working with large collections due to better cache utilization.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use small_range::SmallRange;
+use std::hint::black_box;
 use std::ops::Range;
 
 // Number of elements for benchmarks
