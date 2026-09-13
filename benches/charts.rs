@@ -1,5 +1,6 @@
-//! Renders the charts and tables for every recorded criterion result and,
-//! with `--write`, splices them into `BENCHMARKS.md` between
+//! Renders the charts and tables for every recorded criterion result to the
+//! terminal and, with `--write`, saves each chart as `docs/charts/NAME.svg`
+//! and splices the tables and image links into `BENCHMARKS.md` between
 //! `<!-- generated:NAME -->` markers. Run the other benches first:
 //!
 //! ```text
@@ -23,14 +24,16 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut blocks: Vec<(&str, String)> = vec![("sizes", charts::fenced(&charts::sizes_chart()))];
+    // Markdown bodies: tables inline, charts as SVG images under docs/charts.
+    let mut blocks: Vec<(&str, String)> = Vec::new();
+    let mut charts: Vec<(&str, charts::Chart)> = vec![("sizes", charts::sizes_chart())];
     blocks.push(("scans_table", charts::table(&all, SCAN_GROUPS)));
     if let Some(c) = charts::speedup_chart(
         &all,
         SCAN_GROUPS,
         "bulk scans: speedup over Option<Range<usize>> (higher is better)",
     ) {
-        blocks.push(("scans_speedup", charts::fenced(&c)));
+        charts.push(("scans_speedup", c));
     }
     blocks.push(("workloads_table", charts::table(&all, WORKLOAD_GROUPS)));
     if let Some(c) = charts::speedup_chart(
@@ -38,16 +41,24 @@ fn main() {
         WORKLOAD_GROUPS,
         "workloads: speedup over Option<Range<usize>> (higher is better)",
     ) {
-        blocks.push(("workloads_speedup", charts::fenced(&c)));
+        charts.push(("workloads_speedup", c));
     }
     for group in SCAN_GROUPS.iter().chain(WORKLOAD_GROUPS) {
         if let Some(c) = charts::group_chart(&all, group) {
-            blocks.push((group, charts::fenced(&c)));
+            charts.push((group, c));
+        }
+    }
+    for (name, chart) in &charts {
+        println!("<!-- {name} -->\n{}\n", chart.text());
+        if write {
+            blocks.push((name, charts::image(name, chart).expect("write svg")));
         }
     }
 
     for (name, body) in &blocks {
-        println!("<!-- {name} -->\n{body}\n");
+        if !body.starts_with("![") {
+            println!("<!-- {name} -->\n{body}\n");
+        }
     }
 
     if write {

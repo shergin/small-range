@@ -8,10 +8,11 @@ cargo bench --bench workloads             # the usual patterns
 cargo bench --bench charts -- --write     # regenerate the charts and tables below
 ```
 
-Every chart and table between `<!-- generated -->` markers in this file is
+Every table and chart between `<!-- generated -->` markers in this file is
 produced by the `charts` target from criterion's recorded estimates, never
-typed by hand. The two criterion benches also print their charts when they
-finish. Numbers below are from Apple Silicon, macOS, rustc 1.100 nightly.
+typed by hand. Charts are rendered with `malevich` and saved as SVG under
+`docs/charts/`, so the series keep their colors here; the two criterion
+benches print the same charts as text when they finish. Numbers below are from Apple Silicon, macOS, rustc 1.100 nightly.
 Medians are shown; a dagger marks a cell whose 95% interval is wider than
 ±2% of the median.
 
@@ -26,24 +27,7 @@ Five representations are compared:
 | `Option<SmallRange<u32, 8>>` | 24 bits of start, 8 of length |
 
 <!-- generated:sizes -->
-```text
-                                         size in bytes
-                            ██ Option<R>  ██ { u32, Option<R> } node
-  30 ┤           ██████
-     │           ██████
-  25 ┤    ▁▁▁▁▁▁ ██████
-b    │    ██████ ██████
-y 20 ┤    ██████ ██████
-t    │    ██████ ██████           ▁▁▁▁▁▁                            ▁▁▁▁▁▁
-e 15 ┤    ██████ ██████           ██████                            ██████
-s    │    ██████ ██████    ▅▅▅▅▅▅ ██████           ▅▅▅▅▅▅           ██████
-  10 ┤    ██████ ██████    ██████ ██████    ▂▂▂▂▂▂ ██████    ▂▂▂▂▂▂ ██████           ▂▂▂▂▂▂
-     │    ██████ ██████    ██████ ██████    ██████ ██████    ██████ ██████           ██████
-   5 ┤    ██████ ██████    ██████ ██████    ██████ ██████    ██████ ██████     ▆▆▆▆▆ ██████
-   0 ┤    ██████ ██████    ██████ ██████    ██████ ██████    ██████ ██████     █████ ██████
-     └──────────────────────────────────────────────────────────────────────────────────────────
-           Range<usize>      Range<u32>       hand-rolled      SR<u64, 32>      SR<u32, 8>
-```
+![sizes](docs/charts/sizes.svg)
 <!-- /generated -->
 
 ## Bulk scans
@@ -56,41 +40,18 @@ that leaves every cache.
 <!-- generated:scans_table -->
 | benchmark | `Range<usize>` | `Range<u32>` | `{u32, NonZeroU32}` | `SmallRange<u64, 32>` | `SmallRange<u32, 8>` |
 |---|---:|---:|---:|---:|---:|
-| sum_len / 1000000 | 954.4 µs | 407.7 µs |  | 199.7 µs | 117.5 µs |
-| sum_len / 10000000 | 9.37 ms | 3.93 ms |  | 1.98 ms | 1.18 ms |
-| sum_start / 1000000 | 406.3 µs | 407.0 µs |  | 122.0 µs | 58.8 µs |
-| sum_start / 10000000 | 4.06 ms | 3.96 ms |  | 1.33 ms | 673.8 µs |
-| contains / 1000000 | 781.7 µs | 805.4 µs |  | 523.9 µs | 572.0 µs |
-| contains / 10000000 | 7.90 ms | 7.79 ms |  | 5.23 ms | 5.76 ms |
-| creation | 1.95 ms | 1.09 ms |  | 1.61 ms | 1.65 ms |
-| large_scan / 100000000 | 94.14 ms | 40.01 ms |  | 20.02 ms | 11.99 ms |
+| sum_len / 1000000 | 941.4 µs | 411.9 µs |  | 199.0 µs | 117.7 µs |
+| sum_len / 10000000 | 9.50 ms | 4.01 ms |  | 2.04 ms | 1.21 ms |
+| sum_start / 1000000 | 410.0 µs | 407.0 µs |  | 122.4 µs | 58.6 µs |
+| sum_start / 10000000 | 4.13 ms | 3.99 ms |  | 1.35 ms | 702.7 µs |
+| contains / 1000000 | 784.7 µs | 807.1 µs |  | 519.4 µs | 573.9 µs |
+| contains / 10000000 | 7.92 ms | 7.87 ms |  | 5.22 ms | 5.73 ms |
+| creation | 1.98 ms | 1.09 ms |  | 1.62 ms | 1.66 ms |
+| large_scan / 100000000 | 94.64 ms | 40.31 ms |  | 20.02 ms | 11.99 ms |
 <!-- /generated -->
 
 <!-- generated:scans_speedup -->
-```text
-                       bulk scans: speedup over Option<Range<usize>> (higher is better)
-     ██ Range<usize>  ██ Range<u32>  ██ {u32, NonZeroU32}  ██ SmallRange<u64, 32>  ██ SmallRange<u32, 8>
-  8 ┤                 ▇▇▇                                                                             ▅▅▅
-    │                 ███                                                                             ███
-  7 ┤                 ███                                                                             ███
-    │                 ███                                                                             ███
-  6 ┤                 ███                 ▅▅▅                                                         ███
-    │                 ███                 ███                                                         ███
-  5 ┤                 ███                 ███                                                         ███
-    │              ▆▆▆███                 ███                                                      ▅▅▅███
-x   │              ██████                 ███                                                      ██████
-  4 ┤              ██████                 ███                                                      ██████
-    │              ██████                 ███                                                      ██████
-  3 ┤              ██████              ██████                                                      ██████
-    │        ▄▄▄   ██████              ██████                                               ▄▄▄    ██████
-  2 ┤        ███   ██████              ██████                        ▇▇▇ ▂▂                 ███    ██████
-    │        ███   ██████              ██████              ▅▅▅▂▂▂    ███ ██                 ███    ██████
-  1 ┤     ▄▄▄███   ██████     ▄▄ ▄▄▄   ██████    ▄▄▄ ▄▄    ██████    ███ ██    ▇▇▇▇▇▇    ▄▄▄███    ██████
-    │     ██████   ██████     ██ ███   ██████    ███ ██    ██████    ███ ██    ██████    ██████    ██████
-  0 ┤     ██████   ██████     ██ ███   ██████    ███ ██    ██████    ███ ██    ██████    ██████    ██████
-    └─────────────────────────────────────────────────────────────────────────────────────────────────────────
-              sum_len            sum_start           contains            creation           large_scan
-```
+![scans_speedup](docs/charts/scans_speedup.svg)
 <!-- /generated -->
 
 - Scan time tracks bytes moved once the loop vectorizes. The 100M-entry scan
@@ -117,7 +78,7 @@ in graph nodes at two sizes, three-state memo lookups, random access into a
 | benchmark | `Range<usize>` | `Range<u32>` | `{u32, NonZeroU32}` | `SmallRange<u64, 32>` | `SmallRange<u32, 8>` |
 |---|---:|---:|---:|---:|---:|
 | slice_sum | 15.02 ms | 14.89 ms | 14.66 ms | 14.66 ms | 14.62 ms |
-| iterate_indices | 1.10 ms | 1.09 ms | 1.06 ms | 1.05 ms | 1.07 ms |
+| iterate_indices | 1.10 ms | 1.10 ms | 1.08 ms | 1.07 ms | 1.08 ms |
 | graph_walk / 131072 | 14.64 ms | 14.20 ms | 14.51 ms | 14.35 ms | 14.01 ms |
 | graph_walk / 2097152 | 59.32 ms | 47.28 ms | 40.95 ms | 46.58 ms | 33.92 ms |
 | memo_lookup | 13.73 ms | 13.71 ms | 6.22 ms | 4.67 ms | 6.21 ms |
@@ -127,30 +88,7 @@ in graph nodes at two sizes, three-state memo lookups, random access into a
 <!-- /generated -->
 
 <!-- generated:workloads_speedup -->
-```text
-                       workloads: speedup over Option<Range<usize>> (higher is better)
-     ██ Range<usize>  ██ Range<u32>  ██ {u32, NonZeroU32}  ██ SmallRange<u64, 32>  ██ SmallRange<u32, 8>
-  3.0 ┤                                                             ▅▅
-      │                                                             ██
-      │                                                             ██
-  2.5 ┤                                                             ██
-      │                                                          ▃▃▃██ ▃▃
-      │                                                          █████ ██
-  2.0 ┤                                                          █████ ██
-      │                                               ▅▅         █████ ██
-x     │                                               ██         █████ ██
-  1.5 ┤                                          ▇▇   ██         █████ ██              ▆▆
-      │                                       ▅▅▅██▆▆▆██         █████ ██           ▇▇▇██
-  1.0 ┤    ▁▁▂▂▂▂▂ ▂▂▃▃▃   ▁▁▁▂▂▃▃▃▄▄ ▃▃    ▁▁██████████    ▁▁ ▁▁█████ ██   ▁▁▁▁▁ ███████    ▁▁▅▅▅▇▇ ▇▇▂▂▂
-      │    ███████ █████   ██████████ ██    ████████████    ██ ███████ ██   █████ ███████    ███████ █████
-      │    ███████ █████   ██████████ ██    ████████████    ██ ███████ ██   █████ ███████    ███████ █████
-  0.5 ┤    ███████ █████   ██████████ ██    ████████████    ██ ███████ ██   █████ ███████    ███████ █████
-      │    ███████ █████   ██████████ ██    ████████████    ██ ███████ ██   █████ ███████    ███████ █████
-      │    ███████ █████   ██████████ ██    ████████████    ██ ███████ ██   █████ ███████    ███████ █████
-  0.0 ┤    ███████ █████   ██████████ ██    ████████████    ██ ███████ ██   █████ ███████    ███████ █████
-      └───────────────────────────────────────────────────────────────────────────────────────────────────────
-             slice_sum     iterate_indices   graph_walk      memo_lookup     random_access    sort_by_key
-```
+![workloads_speedup](docs/charts/workloads_speedup.svg)
 <!-- /generated -->
 
 - **Slicing and iterating are a wash.** Once the range is decoded the work
@@ -163,26 +101,7 @@ x     │                                               ██         ███
   `SmallRange<u64, 32>` node, as the sizes predict.
 
 <!-- generated:graph_walk -->
-```text
-                            graph_walk: ns per element (lower is better)
-██ Range<usize>  ██ Range<u32>  ██ {u32, NonZeroU32}  ██ SmallRange<u64, 32>  ██ SmallRange<u32, 8>
-  60 ┤                                                   ▇▇▇▇▇▇
-     │                                                   ██████
-  50 ┤                                                   ██████ ▁▁▁▁▁▁
-     │                                                   ██████ ██████       ▇▇▇▇▇▇
-  40 ┤                                                   ██████ ██████ ▅▅▅▅▅▅██████
-     │                                                   ██████ ██████ ████████████
-n    │                                                   ██████ ██████ ████████████ ██████
-s 30 ┤                                                   ██████ ██████ ████████████ ██████
-     │                                                   ██████ ██████ ████████████ ██████
-  20 ┤                                                   ██████ ██████ ████████████ ██████
-     │          ▅▅▅▅▅▅▄▄▄▄▄▄ ▅▅▅▅▅▅ ▄▄▄▄▄▄▄▄▄▄▄▄         ██████ ██████ ████████████ ██████
-  10 ┤          ████████████ ██████ ████████████         ██████ ██████ ████████████ ██████
-     │          ████████████ ██████ ████████████         ██████ ██████ ████████████ ██████
-   0 ┤          ████████████ ██████ ████████████         ██████ ██████ ████████████ ██████
-     └──────────────────────────────────────────────────────────────────────────────────────────────
-                             131072                                    2097152
-```
+![graph_walk](docs/charts/graph_walk.svg)
 <!-- /generated -->
 
 - **Three-state memo tables gain 2x to 3x.** Checking `None`, then empty,

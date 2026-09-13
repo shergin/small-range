@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod charts;
+pub mod svg;
 
 use small_range::SmallRange;
 use std::num::NonZeroU32;

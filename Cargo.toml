@@ -9,7 +9,7 @@ license = "MIT"
 repository = "https://github.com/shergin/small-range"
 documentation = "https://docs.rs/small_range"
 readme = "README.md"
-exclude = [".github/"]
+exclude = [".github/", "docs/"]
 keywords = ["range", "compact", "memory", "niche", "no-std"]
 categories = ["data-structures", "memory-management", "no-std"]
 

@@ -2,6 +2,7 @@
 //! with `malevich`. The criterion benches print these after their run, and
 //! the `charts` bench target regenerates them into `BENCHMARKS.md`.
 
+use super::svg;
 use super::{Asym, HandRolled, Node, Sym, ORDER, SHORT};
 use malevich::{Bars, Frame, Plot, Scale};
 use std::fs;
@@ -160,6 +161,29 @@ fn unit_label(estimates: &[&Estimate]) -> &'static str {
     }
 }
 
+/// An owned plot and the cell grid it was designed for.
+pub struct Chart {
+    pub plot: Plot<'static>,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Chart {
+    /// Text for a terminal: colors and glyphs as detected for stdout, so a
+    /// pipe gets plain text and a terminal gets the palette.
+    pub fn text(&self) -> String {
+        let mut frame = Frame::detect();
+        frame.width = self.width;
+        frame.height = self.height;
+        self.plot.render(&frame)
+    }
+
+    /// SVG with the light palette, for files that cannot carry escape codes.
+    pub fn svg(&self) -> String {
+        svg::render(&self.plot, self.width, self.height)
+    }
+}
+
 /// One bar series positioned on a band axis.
 struct Series {
     x: Vec<f64>,
@@ -169,7 +193,7 @@ struct Series {
 /// Bars of the median per element for one group.
 /// Groups with several parameter values become grouped bars, one series per
 /// function.
-pub fn group_chart(all: &[Estimate], group: &str) -> Option<String> {
+pub fn group_chart(all: &[Estimate], group: &str) -> Option<Chart> {
     let es: Vec<&Estimate> = all.iter().filter(|e| e.group == group).collect();
     if es.len() < 2 {
         return None;
@@ -184,13 +208,15 @@ pub fn group_chart(all: &[Estimate], group: &str) -> Option<String> {
             .map(|f| find(&es, f, &ps[0]).map_or(f64::NAN, Estimate::per_unit))
             .collect();
         let labels: Vec<&str> = fns.iter().map(|f| short(f)).collect();
-        return Some(
-            Plot::new()
+        return Some(Chart {
+            plot: Plot::new()
                 .layer(Bars::new(labels, &values[..]))
                 .title(title)
                 .y_label("ns")
-                .render_best(&Frame::plain(96, 14)),
-        );
+                .into_owned(),
+            width: 96,
+            height: 14,
+        });
     }
 
     let bands: Vec<String> = ps.iter().map(|p| p.clone().unwrap_or_default()).collect();
@@ -216,13 +242,17 @@ pub fn group_chart(all: &[Estimate], group: &str) -> Option<String> {
     for (f, s) in fns.iter().zip(&series) {
         plot = plot.layer(Bars::at(&s.x[..], width * 0.9, &s.value[..]).label(*f));
     }
-    Some(plot.render_best(&Frame::plain(100, 18)))
+    Some(Chart {
+        plot: plot.into_owned(),
+        width: 100,
+        height: 18,
+    })
 }
 
 /// Speedup of every function over the `Range<usize>` baseline, one band per
 /// group. Groups with several parameters use the largest one; groups without
 /// the baseline are skipped.
-pub fn speedup_chart(all: &[Estimate], groups: &[&str], title: &str) -> Option<String> {
+pub fn speedup_chart(all: &[Estimate], groups: &[&str], title: &str) -> Option<Chart> {
     let mut bands: Vec<&str> = Vec::new();
     let mut rows: Vec<Vec<f64>> = Vec::new(); // per band, indexed by ORDER
     for group in groups {
@@ -266,11 +296,15 @@ pub fn speedup_chart(all: &[Estimate], groups: &[&str], title: &str) -> Option<S
     for (name, (x, v)) in ORDER.iter().zip(&series) {
         plot = plot.layer(Bars::at(&x[..], width * 0.9, &v[..]).label(*name));
     }
-    Some(plot.render_best(&Frame::plain(110, 22)))
+    Some(Chart {
+        plot: plot.into_owned(),
+        width: 110,
+        height: 22,
+    })
 }
 
 /// Bytes per `Option<R>` and per `{ u32, Option<R> }` node.
-pub fn sizes_chart() -> String {
+pub fn sizes_chart() -> Chart {
     let option: Vec<f64> = vec![
         size_of::<Option<Range<usize>>>() as f64,
         size_of::<Option<Range<u32>>>() as f64,
@@ -287,13 +321,18 @@ pub fn sizes_chart() -> String {
     ];
     let left: Vec<f64> = (0..SHORT.len()).map(|i| i as f64 - 0.2).collect();
     let right: Vec<f64> = (0..SHORT.len()).map(|i| i as f64 + 0.2).collect();
-    Plot::new()
+    let plot = Plot::new()
         .x_scale(Scale::bands(SHORT))
         .layer(Bars::at(&left[..], 0.34, &option[..]).label("Option<R>"))
         .layer(Bars::at(&right[..], 0.34, &node[..]).label("{ u32, Option<R> } node"))
         .title("size in bytes")
         .y_label("bytes")
-        .render_best(&Frame::plain(96, 16))
+        .into_owned();
+    Chart {
+        plot,
+        width: 96,
+        height: 16,
+    }
 }
 
 fn fmt_time(ns: f64) -> String {
@@ -350,12 +389,12 @@ pub fn report(groups: &[&str], title: &str) -> String {
     let mut out = String::new();
     for group in groups {
         if let Some(chart) = group_chart(&all, group) {
-            out.push_str(&chart);
+            out.push_str(&chart.text());
             out.push('\n');
         }
     }
     if let Some(chart) = speedup_chart(&all, groups, title) {
-        out.push_str(&chart);
+        out.push_str(&chart.text());
         out.push('\n');
     }
     out.push_str(&table(&all, groups));
@@ -383,7 +422,11 @@ pub fn splice(markdown: &str, name: &str, body: &str) -> Option<String> {
     ))
 }
 
-/// Wraps a chart in a fenced text block for markdown.
-pub fn fenced(chart: &str) -> String {
-    format!("```text\n{}\n```", chart.trim_end())
+/// Writes the chart as `docs/charts/<name>.svg` and returns the markdown
+/// image link for it.
+pub fn image(name: &str, chart: &Chart) -> std::io::Result<String> {
+    let dir = Path::new("docs").join("charts");
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(format!("{name}.svg")), chart.svg())?;
+    Ok(format!("![{name}](docs/charts/{name}.svg)"))
 }

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 748.8 224.0" width="749" height="224" font-family="ui-monospace, Menlo, 'DejaVu Sans Mono', Consolas, monospace" font-size="13" shape-rendering="crispEdges">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="202.8" y="12.5" fill="#1f2328" textLength="343.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">large_scan: ns per element (lower is better)</text>
+<rect x="101.40" y="26.00" width="124.80" height="6.00" fill="#1f2328"/>
+<text x="15.6" y="28.5" fill="#1f2328" textLength="46.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1.00 ┤</text>
+<rect x="101.40" y="32.00" width="124.80" height="16.00" fill="#1f2328"/>
+<text x="54.6" y="44.5" fill="#1f2328" textLength="7.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="101.40" y="48.00" width="124.80" height="16.00" fill="#1f2328"/>
+<text x="15.6" y="60.5" fill="#1f2328" textLength="46.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">0.75 ┤</text>
+<rect x="101.40" y="64.00" width="124.80" height="16.00" fill="#1f2328"/>
+<text x="54.6" y="76.5" fill="#1f2328" textLength="7.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="101.40" y="80.00" width="124.80" height="16.00" fill="#1f2328"/>
+<text x="0.0" y="92.5" fill="#1f2328" textLength="62.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">n      │</text>
+<rect x="101.40" y="96.00" width="124.80" height="16.00" fill="#1f2328"/>
+<text x="0.0" y="108.5" fill="#1f2328" textLength="62.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">s 0.50 ┤</text>
+<rect x="101.40" y="112.00" width="124.80" height="16.00" fill="#1f2328"/>
+<rect x="265.20" y="116.00" width="117.00" height="12.00" fill="#1f2328"/>
+<text x="54.6" y="124.5" fill="#1f2328" textLength="7.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="101.40" y="128.00" width="124.80" height="16.00" fill="#1f2328"/>
+<rect x="265.20" y="128.00" width="117.00" height="16.00" fill="#1f2328"/>
+<text x="54.6" y="140.5" fill="#1f2328" textLength="7.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="101.40" y="144.00" width="124.80" height="16.00" fill="#1f2328"/>
+<rect x="265.20" y="144.00" width="117.00" height="16.00" fill="#1f2328"/>
+<rect x="421.20" y="150.00" width="124.80" height="10.00" fill="#1f2328"/>
+<text x="15.6" y="156.5" fill="#1f2328" textLength="46.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">0.25 ┤</text>
+<rect x="101.40" y="160.00" width="124.80" height="16.00" fill="#1f2328"/>
+<rect x="265.20" y="160.00" width="117.00" height="16.00" fill="#1f2328"/>
+<rect x="421.20" y="160.00" width="124.80" height="16.00" fill="#1f2328"/>
+<rect x="585.00" y="164.00" width="117.00" height="12.00" fill="#1f2328"/>
+<text x="54.6" y="172.5" fill="#1f2328" textLength="7.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="101.40" y="176.00" width="124.80" height="16.00" fill="#1f2328"/>
+<rect x="265.20" y="176.00" width="117.00" height="16.00" fill="#1f2328"/>
+<rect x="421.20" y="176.00" width="124.80" height="16.00" fill="#1f2328"/>
+<rect x="585.00" y="176.00" width="117.00" height="16.00" fill="#1f2328"/>
+<text x="15.6" y="188.5" fill="#1f2328" textLength="46.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">0.00 ┤</text>
+<text x="54.6" y="204.5" fill="#1f2328" textLength="694.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="117.0" y="220.5" fill="#1f2328" textLength="569.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Range&lt;usize&gt;         Range&lt;u32&gt;           SR&lt;u64, 32&gt;          SR&lt;u32, 8&gt;</text>
+</svg>
