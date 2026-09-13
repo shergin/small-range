@@ -1,233 +1,210 @@
 # small_range
 
-A compact range type: 50% smaller than Range<T> with zero-cost Option.
-
-> Imagine you need to store `Option<Range<usize>>` millions of times. That's 192 bits per instance. With this library you can shrink that to just 64 bits (see tradeoffs).
-
-## Motivation
-
-Standard `Range<T>` stores start and end as separate fields, requiring `2 * size_of::<T>()` bytes. For applications managing millions of ranges (spatial indexing, text processing, interval trees), this overhead adds up.
-
-`SmallRange<T>` packs start and length into a single value of type `T`:
-
-| Type | Size | vs `Range<T>` | Max Start | Max Length |
-|------|------|---------------|-----------|------------|
-| `SmallRange<u16>` | 2 bytes | **vs 4 bytes (50%)** | 254 | 254 |
-| `SmallRange<u32>` | 4 bytes | **vs 8 bytes (50%)** | 65,534 | 65,534 |
-| `SmallRange<u64>` | 8 bytes | **vs 16 bytes (50%)** | ~4.29B | ~4.29B |
-| `SmallRange<usize>` | 8 bytes | **vs 16 bytes (50%)** | ~4.29B | ~4.29B |
-
-Plus: `Option<SmallRange<T>>` is the same size as `SmallRange<T>` due to niche optimization.
+A half-open range packed into one integer, with a configurable split between
+the start and length fields and a zero-cost `Option`.
 
 ```rust
 use small_range::SmallRange;
 use core::mem::size_of;
 
-// 50% space savings
-assert_eq!(size_of::<SmallRange<u64>>(), 8);      // vs Range<u64> = 16 bytes
-assert_eq!(size_of::<SmallRange<usize>>(), 8);    // vs Range<usize> = 16 bytes
+// 24 bits of start, 8 bits of length, in 4 bytes.
+type HopRange = SmallRange<u32, 8>;
 
-// Option adds no overhead (niche optimization)
-assert_eq!(size_of::<SmallRange<u64>>(), size_of::<Option<SmallRange<u64>>>());
+let r = HopRange::new(10, 20);
+assert_eq!(r.start(), 10);
+assert_eq!(r.end(), 20);
+assert_eq!(r.len(), 10);
+
+// The Option costs nothing.
+assert_eq!(size_of::<Option<HopRange>>(), 4);
+
+// It indexes slices directly.
+let data = [0u8; 32];
+assert_eq!(data[r].len(), 10);
 ```
 
-## Use Cases
+## Why
 
-Half the memory footprint means better cache locality. Ideal for:
+`Range<usize>` is 16 bytes, `Option<Range<usize>>` is 24, and neither is
+`Copy`. Code that stores many ranges usually stores them in `usize` because
+that is what slicing wants, even when the values are small.
 
-- **HFT / Low-latency systems**: Order book ranges, tick intervals, buffer slices
-- **Game engines**: Entity ID ranges, spatial partitions, collision bounds
-- **Compilers & IDEs**: Source spans, token ranges, AST extents
-- **Databases**: Index ranges, row bounds, interval trees
+`SmallRange<S, LEN_BITS>` stores `start` and `len` in one word of type `S`.
+The low `LEN_BITS` bits hold `len + 1`, so the word is never zero and
+`Option<SmallRange<..>>` is the same size as the range itself. The API side
+stays `usize`, so nothing needs casting to index a slice.
 
-## API Overview
+The split is yours to choose. Ranges that index a large table but are
+themselves short, such as source spans or adjacency lists, can spend most of
+the word on `start`:
+
+| type | bytes | max start | max len |
+|------|-------|-----------|---------|
+| `SmallRange<u16, 8>`  | 2 | 255 | 254 |
+| `SmallRange<u32, 8>`  | 4 | 16,777,215 | 254 |
+| `SmallRange<u32, 10>` | 4 | 4,194,303 | 1,022 |
+| `SmallRange<u32, 16>` | 4 | 65,535 | 65,534 |
+| `SmallRange<u64, 16>` | 8 | 2<sup>48</sup> − 1 | 65,534 |
+| `SmallRange<u64, 24>` | 8 | 2<sup>40</sup> − 1 | 2<sup>24</sup> − 2 |
+| `SmallRange<u64, 32>` | 8 | 2<sup>32</sup> − 1 | 2<sup>32</sup> − 2 |
+
+`LEN_BITS` must be at least 1 and less than the storage width; anything else
+fails to compile. `MAX_START` and `MAX_LEN` are associated constants.
 
 ```rust
 use small_range::SmallRange;
 
-// Create a range (defaults to u64 storage)
-let range = SmallRange::new(10u64, 20u64);
+assert_eq!(SmallRange::<u32, 8>::MAX_START, 16_777_215);
+assert_eq!(SmallRange::<u32, 8>::MAX_LEN, 254);
+assert_eq!(SmallRange::<u64, 32>::MAX_START, u32::MAX as usize);
+```
 
-// Access bounds
-assert_eq!(range.start(), 10u64);
-assert_eq!(range.end(), 20u64);   // exclusive, like std Range
-assert_eq!(range.len(), 10);
-assert!(!range.is_empty());
+## Construction
 
-// Iterate
-for i in &range {
-    println!("{}", i);
+`new` panics when the range does not fit, in release builds too. `try_new`
+returns `None` instead and compiles branch-free. Both check `start <= end`,
+`start <= MAX_START` and `end - start <= MAX_LEN`.
+
+```rust
+use small_range::SmallRange;
+type R = SmallRange<u32, 8>;
+
+assert_eq!(R::try_new(3, 7), Some(R::new(3, 7)));
+assert_eq!(R::try_new(7, 3), None);          // start > end
+assert_eq!(R::try_new(0, 255), None);        // length 255 > MAX_LEN
+assert_eq!(R::from_start_len(3, 4), R::new(3, 7));
+assert_eq!(R::try_from(3..7), Ok(R::new(3, 7)));
+assert!(R::try_from(0..1000).is_err());
+```
+
+The panic message names the type and the limits:
+
+```text
+small_range::small_range::SmallRange<u32, 8>: range 0..300 does not fit: max start is 16777215, max length is 254
+```
+
+`unsafe fn new_unchecked` skips the checks for callers that have already
+proven the bounds.
+
+## Using a range
+
+```rust
+use small_range::SmallRange;
+type R = SmallRange<u64, 32>;
+
+let r = R::new(5, 8);
+
+// Accessors.
+assert_eq!((r.start(), r.end(), r.len(), r.is_empty()), (5, 8, 3, false));
+assert!(r.contains(6));
+assert!(r.overlaps(R::new(7, 20)));
+
+// Iteration yields usize.
+let items: Vec<usize> = r.into_iter().collect();
+assert_eq!(items, vec![5, 6, 7]);
+for i in &r {
+    assert!(r.contains(i));
 }
 
-// Convert to standard Range
-let std_range: core::ops::Range<u64> = range.to_range();
+// Indexing works on slices, arrays and str, and with the default `alloc`
+// feature on Vec and String.
+let v = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+assert_eq!(&v[r], &[5, 6, 7]);
+assert_eq!(&"abcdefghij"[r], "fgh");
+
+// Conversions to and from std.
+let std: core::ops::Range<usize> = r.into();
+assert_eq!(std, 5..8);
+assert_eq!(r.to_range(), 5..8);
+
+// Debug prints like a std range.
+assert_eq!(format!("{r:?}"), "5..8");
+
+// Ord sorts by start, then by length.
+let mut v = [R::new(3, 9), R::new(1, 2), R::new(3, 4)];
+v.sort();
+assert_eq!(v, [R::new(1, 2), R::new(3, 4), R::new(3, 9)]);
 ```
 
-### Storage Types
+`Option<SmallRange<..>>` gives three distinguishable states in one word:
+`None`, an empty `Some`, and a populated `Some`. Memo tables use this to tell
+"not computed" from "computed, nothing there".
+
+## Encoding
+
+The packed word is public API, reachable through `to_bits` and `from_bits`:
+
+```text
+SmallRange<u32, 8>
++--------------------------+----------+
+|          start           |  len + 1 |   NonZero<u32>
+|         24 bits          |  8 bits  |
++--------------------------+----------+
+```
 
 ```rust
 use small_range::SmallRange;
-use core::mem::size_of;
+type R = SmallRange<u32, 8>;
 
-// SmallRange<u16>: 2 bytes, values 0-254
-let r16 = SmallRange::<u16>::new(0, 100);
-assert_eq!(size_of::<SmallRange<u16>>(), 2);
-
-// SmallRange<u32>: 4 bytes, values 0-65,534
-let r32 = SmallRange::<u32>::new(0, 1000);
-assert_eq!(size_of::<SmallRange<u32>>(), 4);
-
-// SmallRange<u64>: 8 bytes, values 0-4,294,967,294 (default)
-let r64 = SmallRange::<u64>::new(0, 1_000_000);
-assert_eq!(size_of::<SmallRange<u64>>(), 8);
-
-// SmallRange<usize>: convenient for slice indexing
-let r_usize = SmallRange::<usize>::new(0, 100);
-let data = vec![0; 200];
-let slice = &data[r_usize.start()..r_usize.end()];
+assert_eq!(R::new(2, 5).to_bits(), (2 << 8) | 4);
+assert_eq!(R::from_bits((2 << 8) | 4), Some(R::new(2, 5)));
+assert_eq!(R::from_bits(0), None);        // the niche
+assert_eq!(R::from_bits(2 << 8), None);   // zero length field
 ```
+
+Because only the length field is biased, `start` decodes with a single shift,
+and for byte-aligned splits the compiler reads it with a narrow load.
 
 ## Limitations
 
-### Value Constraints
+- **No `RangeBounds`.** The trait returns references to stored bounds, and
+  this type stores none. Use `to_range()` or `.into()` where a `RangeBounds`
+  is required, such as `Vec::drain` or `BTreeMap::range`.
+- **Capacity is real.** A `SmallRange<u32, 8>` cannot hold a length of 255.
+  `new` panics and `try_new` returns `None`; pick the split from your data.
+- **`usize` storage is platform-sized.** `SmallRange<usize, N>` has 32-bit
+  halves on 32-bit targets. Prefer `u32` or `u64` for a portable layout.
+- **The byte order of the word is the platform's.** Serialize through the
+  `serde` feature, which writes `start` and `end`, rather than through the
+  raw bits.
 
-Start and length must each fit in half the storage width minus 1:
-- `SmallRange<u16>`: max start = 254, max length = 254
-- `SmallRange<u32>`: max start = 65,534, max length = 65,534
-- `SmallRange<u64>`: max start = 4,294,967,294, max length = 4,294,967,294
+## Features
 
-```rust,ignore
-use small_range::SmallRange;
+- `alloc` (default): `Index` impls for `Vec<T>` and `String`. Slices, arrays
+  and `str` work without it.
+- `serde`: `Serialize` as `{ "start": .., "end": .. }` and `Deserialize` with
+  the same validation as `try_new`.
 
-// This will panic in debug mode (start exceeds capacity)
-let invalid = SmallRange::<u16>::new(255, 256);
-```
+The crate is `no_std` and has no required dependencies. Minimum supported
+Rust version is 1.85.
 
-### No `RangeBounds` Implementation
+## Migrating from 1.x
 
-`SmallRange` does not implement `RangeBounds<T>` because the trait requires returning references (`Bound<&T>`), but our values are computed from packed bits -- there's no stored `T` to reference.
+- `SmallRange<T>` is now `SmallRange<S, LEN_BITS>`. The 1.x layouts are
+  `SmallRange<u16, 8>`, `SmallRange<u32, 16>`, `SmallRange<u64, 32>` and
+  `SmallRange<usize, 32>` on 64-bit targets.
+- All bounds are `usize` on the API side, whatever the storage type.
+- `new` now checks its arguments in release builds. In 1.x an invalid range
+  could produce a zero word and undefined behavior; 1.x should not be used.
+- `start` is no longer biased, so `MAX_START` grew by one and the packed word
+  of a given range changed. Nothing that persisted raw bits is compatible.
+- `contains` and `overlaps` take their arguments by value.
+- `Debug` prints `10..20` instead of a struct.
+- `Ord`, `From<SmallRange> for Range<usize>`, `TryFrom<Range<usize>>`,
+  `from_start_len`, `to_bits`, `from_bits` and slice indexing are new.
 
-**Workaround**: Use `.to_range()` which returns `Range<T>`, and `Range<T>` implements `RangeBounds<T>`:
+## Benchmarks
 
-```rust
-use small_range::SmallRange;
-use core::ops::RangeBounds;
-
-let small = SmallRange::new(10u64, 20u64);
-
-// to_range() gives full RangeBounds support
-let range = small.to_range();
-assert!(range.contains(&15));
-assert!(!range.contains(&25));
-```
-
-### Sealed Trait
-
-The `SmallRangeStorage` trait is sealed -- only `u16`, `u32`, `u64`, and `usize` are supported.
-
-## Implementation Details
-
-### Encoding Scheme
-
-Values are packed as `(start+1, length+1)` where start is in the high bits and length is in the low bits:
-
-```text
-SmallRange<u32> in 4 bytes:
-+----------------+----------------+
-|   start + 1    |  length + 1    |  -> NonZero<u32>
-|   (16 bits)    |   (16 bits)    |
-+----------------+----------------+
-
-SmallRange<u64> in 8 bytes:
-+--------------------------------+--------------------------------+
-|           start + 1            |          length + 1            |  -> NonZero<u64>
-|           (32 bits)            |           (32 bits)            |
-+--------------------------------+--------------------------------+
-```
-
-By adding 1 to both start and length:
-- Both halves are always >= 1, so the packed value is never zero
-- Zero is reserved for `Option::None` (niche optimization)
-- `len()` is a simple mask + subtract operation
-
-### Performance
-
-All operations are `#[inline]` and compile to minimal assembly:
-- `new()`: Subtract, two adds, shift, OR
-- `start()`: Shift, mask, subtract
-- `end()`: Shift, mask, subtract, add
-- `len()`: Mask, subtract
-
-No heap allocation, no branches, no function calls.
-
-**[See full benchmark results](BENCHMARKS.md)** comparing `Option<SmallRange>` vs `Option<Range>` with 100 million entries:
-- **2.4x faster** sequential scans (better cache utilization)
-- **2.3x faster** creation
-- **3x less memory** (800 MB vs 2.4 GB)
-
-### Memory Layout
-
-```rust
-use small_range::SmallRange;
-use core::mem::{size_of, align_of};
-
-// Transparent wrapper around NonZero<T>
-assert_eq!(size_of::<SmallRange<u64>>(), 8);
-assert_eq!(align_of::<SmallRange<u64>>(), 8);
-
-// Niche optimization works
-assert_eq!(size_of::<Option<SmallRange<u64>>>(), 8);
-```
-
-## Quick Reference
-
-### Construction
-
-| Method | Description |
-|--------|-------------|
-| `SmallRange::new(start, end)` | Create from start and end values |
-| `SmallRange::default()` | Empty range (0, 0) |
-
-### Accessors
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `start()` | `T` | Start bound (inclusive) |
-| `end()` | `T` | End bound (exclusive) |
-| `len()` | `usize` | Number of elements |
-| `is_empty()` | `bool` | True if start == end |
-| `to_range()` | `Range<T>` | Convert to std Range |
-
-### Iteration
-
-| Method | Yields | Description |
-|--------|--------|-------------|
-| `for x in range` | `T` | Consuming iteration |
-| `for x in &range` | `T` | Borrowing iteration |
-
-### Traits
-
-| Trait | Notes |
-|-------|-------|
-| `Clone`, `Copy` | Zero-cost copy |
-| `PartialEq`, `Eq` | Bitwise comparison |
-| `Hash` | Based on packed bits |
-| `Default` | Empty range (0, 0) |
-| `Debug` | Shows start and end |
-| `IntoIterator` | For both owned and borrowed |
-
-## When to Use SmallRange
-
-**Good fit:**
-- Storing many ranges where memory matters (50% savings)
-- Need `Option<Range>` with zero discriminant overhead
-- Indices that fit in half the storage width (e.g., u32 indices in u64 storage)
-- `no_std` environments (only depends on `num-traits`)
-
-**Poor fit:**
-- Need `RangeBounds` trait directly (use `.to_range()` as workaround)
-- Values exceed half-width capacity
-- Single ranges where memory isn't a concern (just use `Range<T>`)
+See [BENCHMARKS.md](BENCHMARKS.md) for bulk scans and for the usual
+patterns: slicing, iterating, walking an adjacency list, memo lookups, random
+access and sorting, each against `Range<usize>`, `Range<u32>` and a
+hand-rolled `{u32, NonZeroU32}` struct. The short version: a graph walk over
+2M nodes runs 1.7x faster with 8-byte nodes than with 32-byte ones,
+three-state memo lookups gain 2x to 3x, sorting by the derived `Ord` is 1.8x
+faster than a key extraction, and slicing or iterating through the range costs
+the same as through `Range`. The benches draw their results as terminal
+charts with `malevich`, and `cargo bench --bench charts -- --write`
+regenerates the charts and tables in BENCHMARKS.md from the recorded runs.
 
 ## License
 

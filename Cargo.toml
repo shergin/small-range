@@ -1,23 +1,45 @@
 [package]
 name = "small_range"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
+rust-version = "1.85"
 authors = ["Valentin Shergin"]
-description = "A compact range type: 50% smaller than Range<T> with zero-cost Option"
+description = "A compact range type with a configurable start/length bit split and a zero-cost Option"
 license = "MIT"
 repository = "https://github.com/shergin/small-range"
 documentation = "https://docs.rs/small_range"
 readme = "README.md"
-keywords = ["range", "compact", "memory", "niche"]
+exclude = [".github/"]
+keywords = ["range", "compact", "memory", "niche", "no-std"]
 categories = ["data-structures", "memory-management", "no-std"]
 
+[features]
+default = ["alloc"]
+## `Index` impls for `Vec<T>` and `String`.
+alloc = []
+## Serialize as `{ "start": .., "end": .. }` and validate on deserialize.
+serde = ["dep:serde"]
+
 [dependencies]
-num-traits = { version = "0.2", default-features = false }
+serde = { version = "1", optional = true, default-features = false, features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1.0"
 criterion = "0.8"
+serde_json = "1"
+malevich = "1.21"
 
 [[bench]]
 name = "range_comparison"
 harness = false
+
+[[bench]]
+name = "workloads"
+harness = false
+
+[[bench]]
+name = "charts"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true

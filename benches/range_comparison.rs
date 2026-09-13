@@ -1,354 +1,373 @@
-//! Benchmark comparing Option<Range<usize>> vs Option<SmallRange<usize>>
+//! Compares `Option<Range<usize>>`, `Option<Range<u32>>`, and two `SmallRange`
+//! splits on scans, lookups and creation.
 //!
-//! This benchmark demonstrates the performance benefits of SmallRange
-//! when working with large collections due to better cache utilization.
+//! `Option<Range<u32>>` is the fair size baseline: it holds the same value
+//! space as `SmallRange<u64, 32>`. `Option<Range<usize>>` is what most code
+//! actually stores.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+mod common;
+
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use small_range::SmallRange;
 use std::hint::black_box;
 use std::ops::Range;
 
-// Number of elements for benchmarks
-// 100 million entries: ~2.4GB for Option<Range<usize>>, ~800MB for Option<SmallRange<usize>>
-const SMALL_SIZE: usize = 1_000_000; // 1M for quick iteration
-const MEDIUM_SIZE: usize = 10_000_000; // 10M
-const LARGE_SIZE: usize = 100_000_000; // 100M for cache pressure
+/// 8 bytes, 32 bits of start and 32 bits of length.
+type Sym = SmallRange<u64, 32>;
+/// 4 bytes, 24 bits of start and 8 bits of length.
+type Asym = SmallRange<u32, 8>;
 
-/// Generate test data for Option<Range<usize>>
-fn generate_std_ranges(count: usize) -> Vec<Option<Range<usize>>> {
+const SMALL_SIZE: usize = 1_000_000;
+const MEDIUM_SIZE: usize = 10_000_000;
+const LARGE_SIZE: usize = 100_000_000;
+
+/// Starts stay below 2^24 and lengths below 200 so that every type can hold
+/// the same data. One entry in ten is `None`.
+fn bounds(i: usize) -> Option<(usize, usize)> {
+    (i % 10 != 0).then(|| {
+        let start = i % 1_000_000;
+        (start, start + i % 200)
+    })
+}
+
+fn gen<T>(count: usize, make: impl Fn(usize, usize) -> T) -> Vec<Option<T>> {
     (0..count)
-        .map(|i| {
-            if i % 10 == 0 {
-                None // 10% None values
-            } else {
-                Some(i..(i + (i % 1000)))
-            }
-        })
+        .map(|i| bounds(i).map(|(s, e)| make(s, e)))
         .collect()
 }
 
-/// Generate test data for Option<SmallRange<usize>>
-fn generate_small_ranges(count: usize) -> Vec<Option<SmallRange<usize>>> {
-    (0..count)
-        .map(|i| {
-            if i % 10 == 0 {
-                None // 10% None values
-            } else {
-                Some(SmallRange::new(i, i + (i % 1000)))
-            }
+fn gen_all(count: usize) -> Data {
+    Data {
+        std_usize: gen(count, |s, e| s..e),
+        std_u32: gen(count, |s, e| s as u32..e as u32),
+        sym: gen(count, Sym::new),
+        asym: gen(count, Asym::new),
+    }
+}
+
+struct Data {
+    std_usize: Vec<Option<Range<usize>>>,
+    std_u32: Vec<Option<Range<u32>>>,
+    sym: Vec<Option<Sym>>,
+    asym: Vec<Option<Asym>>,
+}
+
+fn bench_sum_len(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sum_len");
+    for size in [SMALL_SIZE, MEDIUM_SIZE] {
+        group.throughput(Throughput::Elements(size as u64));
+        let d = gen_all(size);
+        group.bench_with_input(
+            BenchmarkId::new("Option<Range<usize>>", size),
+            &d.std_usize,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| r.end - r.start)
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<Range<u32>>", size),
+            &d.std_u32,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| (r.end - r.start) as usize)
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<SmallRange<u64, 32>>", size),
+            &d.sym,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| r.len())
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<SmallRange<u32, 8>>", size),
+            &d.asym,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| r.len())
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_sum_start(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sum_start");
+    for size in [SMALL_SIZE, MEDIUM_SIZE] {
+        group.throughput(Throughput::Elements(size as u64));
+        let d = gen_all(size);
+        group.bench_with_input(
+            BenchmarkId::new("Option<Range<usize>>", size),
+            &d.std_usize,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| r.start)
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<Range<u32>>", size),
+            &d.std_u32,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| r.start as usize)
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<SmallRange<u64, 32>>", size),
+            &d.sym,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| r.start())
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<SmallRange<u32, 8>>", size),
+            &d.asym,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .flatten()
+                        .map(|r| r.start())
+                        .fold(0usize, |a, x| a.wrapping_add(x))
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_contains(c: &mut Criterion) {
+    let mut group = c.benchmark_group("contains");
+    for size in [SMALL_SIZE, MEDIUM_SIZE] {
+        group.throughput(Throughput::Elements(size as u64));
+        let d = gen_all(size);
+        group.bench_with_input(
+            BenchmarkId::new("Option<Range<usize>>", size),
+            &d.std_usize,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .enumerate()
+                        .filter(|(i, r)| {
+                            r.as_ref()
+                                .is_some_and(|r| r.contains(&(i % 1_000_000 + 50)))
+                        })
+                        .count()
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<Range<u32>>", size),
+            &d.std_u32,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .enumerate()
+                        .filter(|(i, r)| {
+                            r.as_ref()
+                                .is_some_and(|r| r.contains(&((i % 1_000_000 + 50) as u32)))
+                        })
+                        .count()
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<SmallRange<u64, 32>>", size),
+            &d.sym,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .enumerate()
+                        .filter(|(i, r)| r.is_some_and(|r| r.contains(i % 1_000_000 + 50)))
+                        .count()
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Option<SmallRange<u32, 8>>", size),
+            &d.asym,
+            |b, data| {
+                b.iter(|| {
+                    data.iter()
+                        .enumerate()
+                        .filter(|(i, r)| r.is_some_and(|r| r.contains(i % 1_000_000 + 50)))
+                        .count()
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_creation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("creation");
+    let size = SMALL_SIZE;
+    group.throughput(Throughput::Elements(size as u64));
+    group.bench_function("Option<Range<usize>>", |b| {
+        b.iter(|| gen(black_box(size), |s, e| black_box(s)..black_box(e)))
+    });
+    group.bench_function("Option<Range<u32>>", |b| {
+        b.iter(|| {
+            gen(black_box(size), |s, e| {
+                black_box(s) as u32..black_box(e) as u32
+            })
         })
-        .collect()
-}
-
-/// Benchmark: Sequential read - sum all lengths
-fn bench_sequential_read_sum(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sequential_read_sum");
-
-    for size in [SMALL_SIZE, MEDIUM_SIZE] {
-        group.throughput(Throughput::Elements(size as u64));
-
-        // Benchmark Option<Range<usize>>
-        let std_data = generate_std_ranges(size);
-        group.bench_with_input(
-            BenchmarkId::new("Option<Range<usize>>", size),
-            &std_data,
-            |b, data| {
-                b.iter(|| {
-                    let mut sum: usize = 0;
-                    for range in data.iter() {
-                        if let Some(r) = range {
-                            sum += r.end - r.start;
-                        }
-                    }
-                    black_box(sum)
-                })
-            },
-        );
-        drop(std_data);
-
-        // Benchmark Option<SmallRange<usize>>
-        let small_data = generate_small_ranges(size);
-        group.bench_with_input(
-            BenchmarkId::new("Option<SmallRange<usize>>", size),
-            &small_data,
-            |b, data| {
-                b.iter(|| {
-                    let mut sum: usize = 0;
-                    for range in data.iter() {
-                        if let Some(r) = range {
-                            sum += r.len();
-                        }
-                    }
-                    black_box(sum)
-                })
-            },
-        );
-    }
-
+    });
+    group.bench_function("Option<SmallRange<u64, 32>>", |b| {
+        b.iter(|| gen(black_box(size), |s, e| Sym::new(black_box(s), black_box(e))))
+    });
+    group.bench_function("Option<SmallRange<u32, 8>>", |b| {
+        b.iter(|| {
+            gen(black_box(size), |s, e| {
+                Asym::new(black_box(s), black_box(e))
+            })
+        })
+    });
     group.finish();
 }
 
-/// Benchmark: Sequential read - sum all start values
-fn bench_sequential_read_starts(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sequential_read_starts");
-
-    for size in [SMALL_SIZE, MEDIUM_SIZE] {
-        group.throughput(Throughput::Elements(size as u64));
-
-        let std_data = generate_std_ranges(size);
-        group.bench_with_input(
-            BenchmarkId::new("Option<Range<usize>>", size),
-            &std_data,
-            |b, data| {
-                b.iter(|| {
-                    let mut sum: usize = 0;
-                    for range in data.iter() {
-                        if let Some(r) = range {
-                            sum = sum.wrapping_add(r.start);
-                        }
-                    }
-                    black_box(sum)
-                })
-            },
-        );
-        drop(std_data);
-
-        let small_data = generate_small_ranges(size);
-        group.bench_with_input(
-            BenchmarkId::new("Option<SmallRange<usize>>", size),
-            &small_data,
-            |b, data| {
-                b.iter(|| {
-                    let mut sum: usize = 0;
-                    for range in data.iter() {
-                        if let Some(r) = range {
-                            sum = sum.wrapping_add(r.start());
-                        }
-                    }
-                    black_box(sum)
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-/// Benchmark: Sequential read - check contains
-fn bench_sequential_contains(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sequential_contains");
-
-    for size in [SMALL_SIZE, MEDIUM_SIZE] {
-        group.throughput(Throughput::Elements(size as u64));
-
-        let std_data = generate_std_ranges(size);
-        group.bench_with_input(
-            BenchmarkId::new("Option<Range<usize>>", size),
-            &std_data,
-            |b, data| {
-                b.iter(|| {
-                    let mut count: usize = 0;
-                    for (i, range) in data.iter().enumerate() {
-                        if let Some(r) = range {
-                            if r.contains(&(i + 50)) {
-                                count += 1;
-                            }
-                        }
-                    }
-                    black_box(count)
-                })
-            },
-        );
-        drop(std_data);
-
-        let small_data = generate_small_ranges(size);
-        group.bench_with_input(
-            BenchmarkId::new("Option<SmallRange<usize>>", size),
-            &small_data,
-            |b, data| {
-                b.iter(|| {
-                    let mut count: usize = 0;
-                    for (i, range) in data.iter().enumerate() {
-                        if let Some(r) = range {
-                            if r.contains(i + 50) {
-                                count += 1;
-                            }
-                        }
-                    }
-                    black_box(count)
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-/// Benchmark: Memory bandwidth test with large dataset
-/// This really shows cache effects with 100M+ entries
-fn bench_large_sequential_scan(c: &mut Criterion) {
-    let mut group = c.benchmark_group("large_sequential_scan");
-    group.sample_size(10); // Fewer samples for large data
-
+/// One dataset at a time so that peak memory stays at the largest type.
+fn bench_large_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("large_scan");
+    group.sample_size(10);
     let size = LARGE_SIZE;
     group.throughput(Throughput::Elements(size as u64));
 
-    // Option<Range<usize>>: 24 bytes each = 2.4 GB
-    println!(
-        "Generating {} Option<Range<usize>> entries (~{} GB)...",
-        size,
-        (size * 24) / 1_000_000_000
-    );
-    let std_data = generate_std_ranges(size);
-
+    let data = gen(size, |s, e| s..e);
     group.bench_with_input(
         BenchmarkId::new("Option<Range<usize>>", size),
-        &std_data,
+        &data,
         |b, data| {
             b.iter(|| {
-                let mut sum: usize = 0;
-                for range in data.iter() {
-                    if let Some(r) = range {
-                        sum = sum.wrapping_add(r.end - r.start);
-                    }
-                }
-                black_box(sum)
+                data.iter()
+                    .flatten()
+                    .map(|r| r.end - r.start)
+                    .fold(0usize, |a, x| a.wrapping_add(x))
             })
         },
     );
+    drop(data);
 
-    // Free memory before allocating next dataset
-    drop(std_data);
-
-    // Option<SmallRange<usize>>: 8 bytes each = 800 MB
-    println!(
-        "Generating {} Option<SmallRange<usize>> entries (~{} MB)...",
-        size,
-        (size * 8) / 1_000_000
-    );
-    let small_data = generate_small_ranges(size);
-
+    let data = gen(size, |s, e| s as u32..e as u32);
     group.bench_with_input(
-        BenchmarkId::new("Option<SmallRange<usize>>", size),
-        &small_data,
+        BenchmarkId::new("Option<Range<u32>>", size),
+        &data,
         |b, data| {
             b.iter(|| {
-                let mut sum: usize = 0;
-                for range in data.iter() {
-                    if let Some(r) = range {
-                        sum = sum.wrapping_add(r.len());
-                    }
-                }
-                black_box(sum)
+                data.iter()
+                    .flatten()
+                    .map(|r| (r.end - r.start) as usize)
+                    .fold(0usize, |a, x| a.wrapping_add(x))
             })
         },
     );
+    drop(data);
 
-    group.finish();
-}
-
-/// Benchmark: Creation performance
-fn bench_creation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("creation");
-
-    let size = SMALL_SIZE;
-    group.throughput(Throughput::Elements(size as u64));
-
-    group.bench_function("Option<Range<usize>>", |b| {
-        b.iter(|| {
-            let data: Vec<Option<Range<usize>>> = (0..size)
-                .map(|i| {
-                    if i % 10 == 0 {
-                        None
-                    } else {
-                        Some(black_box(i)..black_box(i + 100))
-                    }
-                })
-                .collect();
-            black_box(data)
-        })
-    });
-
-    group.bench_function("Option<SmallRange<usize>>", |b| {
-        b.iter(|| {
-            let data: Vec<Option<SmallRange<usize>>> = (0..size)
-                .map(|i| {
-                    if i % 10 == 0 {
-                        None
-                    } else {
-                        Some(SmallRange::new(black_box(i), black_box(i + 100)))
-                    }
-                })
-                .collect();
-            black_box(data)
-        })
-    });
-
-    group.finish();
-}
-
-/// Print memory usage comparison
-fn print_memory_comparison() {
-    use std::mem::size_of;
-
-    println!("\n=== Memory Layout Comparison ===\n");
-    println!("Type                          | Size (bytes)");
-    println!("------------------------------|-------------");
-    println!(
-        "Range<usize>                  | {:>12}",
-        size_of::<Range<usize>>()
+    let data = gen(size, Sym::new);
+    group.bench_with_input(
+        BenchmarkId::new("Option<SmallRange<u64, 32>>", size),
+        &data,
+        |b, data| {
+            b.iter(|| {
+                data.iter()
+                    .flatten()
+                    .map(|r| r.len())
+                    .fold(0usize, |a, x| a.wrapping_add(x))
+            })
+        },
     );
+    drop(data);
+
+    let data = gen(size, Asym::new);
+    group.bench_with_input(
+        BenchmarkId::new("Option<SmallRange<u32, 8>>", size),
+        &data,
+        |b, data| {
+            b.iter(|| {
+                data.iter()
+                    .flatten()
+                    .map(|r| r.len())
+                    .fold(0usize, |a, x| a.wrapping_add(x))
+            })
+        },
+    );
+    group.finish();
+}
+
+fn print_layout() {
+    use std::mem::size_of;
     println!(
-        "Option<Range<usize>>          | {:>12}",
+        "\nOption<Range<usize>>          {:>2} bytes",
         size_of::<Option<Range<usize>>>()
     );
     println!(
-        "SmallRange<usize>             | {:>12}",
-        size_of::<SmallRange<usize>>()
+        "Option<Range<u32>>            {:>2} bytes",
+        size_of::<Option<Range<u32>>>()
     );
     println!(
-        "Option<SmallRange<usize>>     | {:>12}",
-        size_of::<Option<SmallRange<usize>>>()
-    );
-    println!();
-    println!("For 100 million entries:");
-    println!(
-        "  Option<Range<usize>>:       {:>6} MB",
-        (100_000_000 * size_of::<Option<Range<usize>>>()) / 1_000_000
+        "Option<SmallRange<u64, 32>>   {:>2} bytes",
+        size_of::<Option<Sym>>()
     );
     println!(
-        "  Option<SmallRange<usize>>:  {:>6} MB",
-        (100_000_000 * size_of::<Option<SmallRange<usize>>>()) / 1_000_000
+        "Option<SmallRange<u32, 8>>    {:>2} bytes\n",
+        size_of::<Option<Asym>>()
     );
-    println!(
-        "  Memory savings:             {:>6}x",
-        size_of::<Option<Range<usize>>>() / size_of::<Option<SmallRange<usize>>>()
-    );
-    println!();
 }
 
-fn bench_print_memory_info(c: &mut Criterion) {
-    // Print memory comparison once at the start
-    print_memory_comparison();
-
-    // Dummy benchmark just to have the function
-    c.bench_function("memory_info_printed", |b| b.iter(|| black_box(1)));
+fn bench_layout(c: &mut Criterion) {
+    print_layout();
+    c.bench_function("layout_printed", |b| b.iter(|| black_box(1)));
 }
 
 criterion_group!(
     benches,
-    bench_print_memory_info,
-    bench_sequential_read_sum,
-    bench_sequential_read_starts,
-    bench_sequential_contains,
+    bench_layout,
+    bench_sum_len,
+    bench_sum_start,
+    bench_contains,
     bench_creation,
-    bench_large_sequential_scan,
+    bench_large_scan,
 );
-
-criterion_main!(benches);
-
-// Run this to see memory comparison before benchmarks
-#[test]
-fn show_memory_comparison() {
-    print_memory_comparison();
+fn main() {
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    if !common::charts::skip_charts() {
+        print!(
+            "{}",
+            common::charts::report(
+                common::charts::SCAN_GROUPS,
+                "bulk scans: speedup over Option<Range<usize>> (higher is better)"
+            )
+        );
+    }
 }

@@ -1,493 +1,459 @@
 extern crate alloc;
 extern crate std;
 
-use crate::SmallRange;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use core::ops::Range;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::{OutOfRange, SmallRange};
+
+type R16 = SmallRange<u16, 8>;
+type R32 = SmallRange<u32, 16>;
+type R64 = SmallRange<u64, 32>;
+type Hop = SmallRange<u32, 8>;
+type Wide = SmallRange<u64, 16>;
+
 // =============================================================================
-// Memory Layout Tests
+// Layout
 // =============================================================================
 
 #[test]
-fn test_space_savings() {
-    // SmallRange<T> is half the size of Range<T>
-    assert_eq!(size_of::<SmallRange<u16>>(), 2);
-    assert_eq!(size_of::<SmallRange<u32>>(), 4);
-    assert_eq!(size_of::<SmallRange<u64>>(), 8);
-    assert_eq!(size_of::<SmallRange<usize>>(), 8);
+fn sizes_match_storage() {
+    assert_eq!(size_of::<R16>(), 2);
+    assert_eq!(size_of::<R32>(), 4);
+    assert_eq!(size_of::<R64>(), 8);
+    assert_eq!(size_of::<Hop>(), 4);
+    assert_eq!(size_of::<Wide>(), 8);
+    assert_eq!(size_of::<SmallRange<usize, 8>>(), size_of::<usize>());
+    assert_eq!(align_of::<Hop>(), 4);
+}
 
-    assert_eq!(size_of::<Range<u16>>(), 4);
-    assert_eq!(size_of::<Range<u32>>(), 8);
-    assert_eq!(size_of::<Range<u64>>(), 16);
-    assert_eq!(size_of::<Range<usize>>(), 16);
+#[test]
+fn option_is_free_for_every_split() {
+    assert_eq!(size_of::<Option<R16>>(), 2);
+    assert_eq!(size_of::<Option<R32>>(), 4);
+    assert_eq!(size_of::<Option<R64>>(), 8);
+    assert_eq!(size_of::<Option<Hop>>(), 4);
+    assert_eq!(size_of::<Option<Wide>>(), 8);
+    assert_eq!(size_of::<Option<SmallRange<u32, 1>>>(), 4);
+    assert_eq!(size_of::<Option<SmallRange<u32, 31>>>(), 4);
+    assert_eq!(size_of::<Option<SmallRange<u64, 63>>>(), 8);
+    assert_eq!(size_of::<Option<Option<Hop>>>(), 8);
+}
 
-    // Option<SmallRange<T>> has same size as SmallRange<T> (niche optimization)
-    assert_eq!(size_of::<Option<SmallRange<u16>>>(), 2);
-    assert_eq!(size_of::<Option<SmallRange<u32>>>(), 4);
-    assert_eq!(size_of::<Option<SmallRange<u64>>>(), 8);
-    assert_eq!(size_of::<Option<SmallRange<usize>>>(), 8);
-
-    // Option<Range<T>> requires extra space for discriminant (no niche optimization)
-    assert_eq!(size_of::<Option<Range<u16>>>(), 6);
+#[test]
+fn versus_std_range() {
     assert_eq!(size_of::<Option<Range<u32>>>(), 12);
-    assert_eq!(size_of::<Option<Range<u64>>>(), 24);
     assert_eq!(size_of::<Option<Range<usize>>>(), 24);
+    assert_eq!(size_of::<Option<R64>>(), 8);
+}
 
-    // 3x space savings for Option<Range<u64/usize>> (24 bytes -> 8 bytes)
-    assert_eq!(
-        size_of::<Option<Range<u64>>>() / size_of::<Option<SmallRange<u64>>>(),
-        3
-    );
+#[test]
+fn hop_shaped_struct_is_eight_bytes() {
+    #[allow(dead_code)]
+    struct HopNode {
+        swap_index: u32,
+        next: Option<Hop>,
+    }
+    assert_eq!(size_of::<HopNode>(), 8);
 }
 
 // =============================================================================
-// Roundtrip Encoding/Decoding Tests
+// Capacities
 // =============================================================================
 
-macro_rules! test_roundtrip_for_type {
-    ($name:ident, $ty:ty, $max_val:expr) => {
+#[test]
+fn capacities() {
+    assert_eq!(Hop::START_BITS, 24);
+    assert_eq!(Hop::MAX_START, (1 << 24) - 1);
+    assert_eq!(Hop::MAX_LEN, 254);
+
+    assert_eq!(R16::MAX_START, 255);
+    assert_eq!(R16::MAX_LEN, 254);
+
+    assert_eq!(R32::MAX_START, 65_535);
+    assert_eq!(R32::MAX_LEN, 65_534);
+
+    assert_eq!(R64::MAX_START, u32::MAX as usize);
+    assert_eq!(R64::MAX_LEN, u32::MAX as usize - 1);
+
+    assert_eq!(Wide::MAX_START, (1 << 48) - 1);
+    assert_eq!(Wide::MAX_LEN, 65_534);
+
+    assert_eq!(SmallRange::<u64, 63>::MAX_START, 1);
+    assert_eq!(SmallRange::<u64, 63>::MAX_LEN, (1u64 << 63) as usize - 2);
+
+    assert_eq!(SmallRange::<u32, 1>::MAX_START, (1 << 31) - 1);
+    assert_eq!(SmallRange::<u32, 1>::MAX_LEN, 0);
+}
+
+// =============================================================================
+// Roundtrip at boundaries
+// =============================================================================
+
+macro_rules! roundtrip_at_boundaries {
+    ($name:ident, $ty:ty) => {
         #[test]
         fn $name() {
-            let test_values: &[$ty] = &[0, 1, 2, 10, 100, $max_val / 2, $max_val - 1, $max_val];
-
-            for &start in test_values {
-                for &len in test_values {
-                    if start.checked_add(len).is_none() {
-                        continue; // Skip overflow cases
+            let starts = [
+                0,
+                1,
+                2,
+                <$ty>::MAX_START / 2,
+                <$ty>::MAX_START.saturating_sub(1),
+                <$ty>::MAX_START,
+            ];
+            let lens = [
+                0,
+                1,
+                2,
+                <$ty>::MAX_LEN / 2,
+                <$ty>::MAX_LEN.saturating_sub(1),
+                <$ty>::MAX_LEN,
+            ];
+            for start in starts {
+                for len in lens {
+                    if start > <$ty>::MAX_START || len > <$ty>::MAX_LEN {
+                        continue;
                     }
-                    let end = start + len;
-
-                    let range = SmallRange::<$ty>::new(start, end);
-                    assert_eq!(
-                        range.start(),
-                        start,
-                        "start mismatch for {}..{}",
-                        start,
-                        end
-                    );
-                    assert_eq!(range.end(), end, "end mismatch for {}..{}", start, end);
-                    assert_eq!(
-                        range.len(),
-                        len as usize,
-                        "len mismatch for {}..{}",
-                        start,
-                        end
-                    );
+                    let Some(end) = start.checked_add(len) else {
+                        continue;
+                    };
+                    let r = <$ty>::new(start, end);
+                    assert_eq!(r.start(), start, "start of {start}..{end}");
+                    assert_eq!(r.end(), end, "end of {start}..{end}");
+                    assert_eq!(r.len(), len, "len of {start}..{end}");
+                    assert_eq!(r.is_empty(), len == 0);
+                    assert_eq!(r.to_range(), start..end);
+                    assert_eq!(<$ty>::try_new(start, end), Some(r));
+                    assert_eq!(<$ty>::from_start_len(start, len), r);
+                    assert_eq!(<$ty>::from_bits(r.to_bits()), Some(r));
                 }
             }
         }
     };
 }
 
-test_roundtrip_for_type!(test_roundtrip_u16, u16, 254);
-test_roundtrip_for_type!(test_roundtrip_u32, u32, 65534);
-test_roundtrip_for_type!(test_roundtrip_u64, u64, 0xFFFF_FFFE);
+roundtrip_at_boundaries!(roundtrip_u16_8, R16);
+roundtrip_at_boundaries!(roundtrip_u32_16, R32);
+roundtrip_at_boundaries!(roundtrip_u32_8, Hop);
+roundtrip_at_boundaries!(roundtrip_u64_32, R64);
+roundtrip_at_boundaries!(roundtrip_u64_16, Wide);
+roundtrip_at_boundaries!(roundtrip_u64_1, SmallRange<u64, 1>);
+roundtrip_at_boundaries!(roundtrip_u64_63, SmallRange<u64, 63>);
+roundtrip_at_boundaries!(roundtrip_usize_8, SmallRange<usize, 8>);
 
 // =============================================================================
-// Boundary Value Tests
+// Rejection and panics (release builds included)
 // =============================================================================
 
 #[test]
-fn test_maximum_values_u16() {
-    // Max start with zero length
-    let r = SmallRange::<u16>::new(254, 254);
-    assert_eq!(r.start(), 254);
-    assert_eq!(r.end(), 254);
-    assert!(r.is_empty());
+fn try_new_rejects_out_of_range() {
+    assert!(Hop::try_new(20, 10).is_none());
+    assert!(Hop::try_new(Hop::MAX_START + 1, Hop::MAX_START + 1).is_none());
+    assert!(Hop::try_new(0, Hop::MAX_LEN + 1).is_none());
+    assert!(Hop::try_new(usize::MAX, usize::MAX).is_none());
+    assert!(Hop::try_new(0, usize::MAX).is_none());
 
-    // Max length from zero
-    let r = SmallRange::<u16>::new(0, 254);
-    assert_eq!(r.start(), 0);
-    assert_eq!(r.end(), 254);
-    assert_eq!(r.len(), 254);
-
-    // Max start + max length would overflow, test just under
-    let r = SmallRange::<u16>::new(100, 200);
-    assert_eq!(r.start(), 100);
-    assert_eq!(r.end(), 200);
-    assert_eq!(r.len(), 100);
+    assert!(Hop::try_new(Hop::MAX_START, Hop::MAX_START).is_some());
+    assert!(Hop::try_new(0, Hop::MAX_LEN).is_some());
+    assert!(Hop::try_new(Hop::MAX_START, Hop::MAX_START + Hop::MAX_LEN).is_some());
 }
 
 #[test]
-fn test_maximum_values_u32() {
-    // Max start with zero length
-    let r = SmallRange::<u32>::new(65534, 65534);
-    assert_eq!(r.start(), 65534);
-    assert_eq!(r.end(), 65534);
-    assert!(r.is_empty());
-
-    // Max length from zero
-    let r = SmallRange::<u32>::new(0, 65534);
-    assert_eq!(r.start(), 0);
-    assert_eq!(r.end(), 65534);
-    assert_eq!(r.len(), 65534);
+fn try_from_start_len_rejects_overflow() {
+    assert!(R64::try_from_start_len(usize::MAX, 1).is_none());
+    assert!(R64::try_from_start_len(1, usize::MAX).is_none());
+    assert_eq!(R64::try_from_start_len(3, 4), Some(R64::new(3, 7)));
 }
 
 #[test]
-fn test_maximum_values_u64() {
-    let max: u64 = 0xFFFF_FFFE;
+#[should_panic(expected = "invalid range 20..10: start exceeds end")]
+fn new_panics_when_start_exceeds_end() {
+    let _ = Hop::new(20, 10);
+}
 
-    // Max start with zero length
-    let r = SmallRange::<u64>::new(max, max);
-    assert_eq!(r.start(), max);
-    assert_eq!(r.end(), max);
-    assert!(r.is_empty());
+#[test]
+#[should_panic(
+    expected = "range 16777216..16777216 does not fit: max start is 16777215, max length is 254"
+)]
+fn new_panics_when_start_too_large() {
+    let _ = Hop::new(1 << 24, 1 << 24);
+}
 
-    // Max length from zero
-    let r = SmallRange::<u64>::new(0, max);
-    assert_eq!(r.start(), 0);
-    assert_eq!(r.end(), max);
-    assert_eq!(r.len(), max as usize);
+#[test]
+#[should_panic(expected = "range 0..255 does not fit")]
+fn new_panics_when_length_too_large() {
+    let _ = Hop::new(0, 255);
+}
+
+#[test]
+#[should_panic(expected = "overflows usize")]
+fn from_start_len_panics_on_overflow() {
+    let _ = R64::from_start_len(usize::MAX, 1);
+}
+
+#[test]
+fn panic_message_names_the_type() {
+    let err = std::panic::catch_unwind(|| Hop::new(5, 3)).unwrap_err();
+    let msg = err.downcast_ref::<String>().cloned().unwrap();
+    assert!(msg.contains("SmallRange<u32, 8>"), "{msg}");
+}
+
+#[test]
+fn out_of_range_display() {
+    let e = OutOfRange {
+        start: 5,
+        end: 3,
+        max_start: 10,
+        max_len: 10,
+    };
+    assert_eq!(format!("{e}"), "invalid range 5..3: start exceeds end");
+    let e = OutOfRange {
+        start: 0,
+        end: 300,
+        max_start: 10,
+        max_len: 254,
+    };
+    assert_eq!(
+        format!("{e}"),
+        "range 0..300 does not fit: max start is 10, max length is 254"
+    );
 }
 
 // =============================================================================
-// Empty Range Tests
+// Bits
 // =============================================================================
 
 #[test]
-fn test_empty_range() {
-    let r = SmallRange::<u32>::new(0, 0);
+fn encoding_is_documented() {
+    assert_eq!(Hop::new(0, 0).to_bits(), 1);
+    assert_eq!(Hop::new(0, 1).to_bits(), 2);
+    assert_eq!(Hop::new(1, 1).to_bits(), (1 << 8) | 1);
+    assert_eq!(Hop::new(2, 5).to_bits(), (2 << 8) | 4);
+    assert_eq!(R64::new(7, 9).to_bits(), (7 << 32) | 3);
+    assert_eq!(
+        Hop::new(Hop::MAX_START, Hop::MAX_START + Hop::MAX_LEN).to_bits(),
+        u32::MAX
+    );
+}
+
+#[test]
+fn from_bits_rejects_invalid_words() {
+    assert_eq!(Hop::from_bits(0), None);
+    assert_eq!(Hop::from_bits(7 << 8), None);
+    assert_eq!(
+        Hop::from_bits(u32::MAX),
+        Some(Hop::new(Hop::MAX_START, Hop::MAX_START + Hop::MAX_LEN))
+    );
+    assert_eq!(Hop::from_bits(1), Some(Hop::default()));
+}
+
+#[test]
+fn new_unchecked_matches_new() {
+    for (s, e) in [
+        (0, 0),
+        (1, 1),
+        (3, 200),
+        (Hop::MAX_START, Hop::MAX_START + Hop::MAX_LEN),
+    ] {
+        // SAFETY: every pair is within capacity.
+        let r = unsafe { Hop::new_unchecked(s, e) };
+        assert_eq!(r, Hop::new(s, e));
+    }
+}
+
+// =============================================================================
+// Semantics
+// =============================================================================
+
+#[test]
+fn default_is_empty_at_zero() {
+    let r = Hop::default();
+    assert_eq!(r.to_range(), 0..0);
     assert!(r.is_empty());
     assert_eq!(r.len(), 0);
-    assert_eq!(r.start(), 0);
-    assert_eq!(r.end(), 0);
-
-    let r = SmallRange::<u32>::new(100, 100);
-    assert!(r.is_empty());
-    assert_eq!(r.len(), 0);
-    assert_eq!(r.start(), 100);
-    assert_eq!(r.end(), 100);
 }
 
 #[test]
-fn test_single_element_range() {
-    let r = SmallRange::<u32>::new(42, 43);
-    assert!(!r.is_empty());
-    assert_eq!(r.len(), 1);
-    assert_eq!(r.start(), 42);
-    assert_eq!(r.end(), 43);
-}
-
-// =============================================================================
-// Default Tests
-// =============================================================================
-
-#[test]
-fn test_default() {
-    let r = SmallRange::<u32>::default();
-    assert!(r.is_empty());
-    assert_eq!(r.start(), 0);
-    assert_eq!(r.end(), 0);
-    assert_eq!(r.len(), 0);
-}
-
-// =============================================================================
-// to_range() Tests
-// =============================================================================
-
-#[test]
-fn test_to_range() {
-    let small = SmallRange::<u32>::new(10, 20);
-    let std_range = small.to_range();
-    assert_eq!(std_range, 10..20);
-
-    let empty = SmallRange::<u32>::new(5, 5);
-    assert_eq!(empty.to_range(), 5..5);
-}
-
-// =============================================================================
-// Iterator Tests
-// =============================================================================
-
-#[test]
-fn test_iteration() {
-    let r = SmallRange::<u32>::new(5, 10);
-    let collected: Vec<_> = r.into_iter().collect();
-    assert_eq!(collected, vec![5, 6, 7, 8, 9]);
+fn some_empty_and_none_are_distinct() {
+    let slots: [Option<Hop>; 3] = [None, Some(Hop::default()), Some(Hop::new(3, 5))];
+    assert!(slots[0].is_none());
+    assert!(slots[1].is_some_and(|r| r.is_empty()));
+    assert!(slots[2].is_some_and(|r| !r.is_empty()));
 }
 
 #[test]
-fn test_iteration_empty() {
-    let r = SmallRange::<u32>::new(5, 5);
-    let collected: Vec<_> = r.into_iter().collect();
-    assert!(collected.is_empty());
+fn debug_prints_like_std_range() {
+    assert_eq!(format!("{:?}", Hop::new(10, 20)), "10..20");
+    assert_eq!(format!("{:?}", Hop::new(5, 5)), "5..5");
+    assert_eq!(format!("{:?}", Some(Hop::new(1, 2))), "Some(1..2)");
 }
 
 #[test]
-fn test_iteration_single() {
-    let r = SmallRange::<u32>::new(42, 43);
-    let collected: Vec<_> = r.into_iter().collect();
-    assert_eq!(collected, vec![42]);
-}
-
-#[test]
-fn test_iteration_by_ref() {
-    let r = SmallRange::<u32>::new(0, 3);
-    let collected: Vec<_> = (&r).into_iter().collect();
-    assert_eq!(collected, vec![0, 1, 2]);
-
-    // Can iterate again since we borrowed
-    let collected2: Vec<_> = (&r).into_iter().collect();
-    assert_eq!(collected2, vec![0, 1, 2]);
-}
-
-// =============================================================================
-// Debug Formatting Tests
-// =============================================================================
-
-#[test]
-fn test_debug_format() {
-    let r = SmallRange::<u32>::new(10, 20);
-    let debug_str = format!("{:?}", r);
-    assert!(debug_str.contains("SmallRange"));
-    assert!(debug_str.contains("start"));
-    assert!(debug_str.contains("end"));
-    assert!(debug_str.contains("10"));
-    assert!(debug_str.contains("20"));
-}
-
-// =============================================================================
-// Equality and Hash Tests
-// =============================================================================
-
-#[test]
-fn test_equality() {
-    let a = SmallRange::<u32>::new(10, 20);
-    let b = SmallRange::<u32>::new(10, 20);
-    let c = SmallRange::<u32>::new(10, 21);
-
+fn equality_and_hash() {
+    fn hash<T: Hash>(t: &T) -> u64 {
+        let mut h = DefaultHasher::new();
+        t.hash(&mut h);
+        h.finish()
+    }
+    let a = R32::new(10, 20);
+    let b = R32::new(10, 20);
+    let c = R32::new(10, 21);
     assert_eq!(a, b);
     assert_ne!(a, c);
-}
-
-#[test]
-fn test_hash_consistency() {
-    fn hash<T: Hash>(t: &T) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        t.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    let a = SmallRange::<u32>::new(10, 20);
-    let b = SmallRange::<u32>::new(10, 20);
-
     assert_eq!(hash(&a), hash(&b));
 }
 
 #[test]
-fn test_copy_clone() {
-    let original = SmallRange::<u32>::new(10, 20);
-    let copied = original; // Copy
-    let cloned = original.clone(); // Clone
-
-    assert_eq!(original, copied);
-    assert_eq!(original, cloned);
-}
-
-// =============================================================================
-// try_new() Tests
-// =============================================================================
-
-#[test]
-fn test_try_new_valid() {
-    let r = SmallRange::<u32>::try_new(10, 20);
-    assert!(r.is_some());
-    let r = r.unwrap();
-    assert_eq!(r.start(), 10);
-    assert_eq!(r.end(), 20);
+fn ord_is_start_then_len() {
+    let mut v = [
+        Hop::new(5, 9),
+        Hop::new(1, 3),
+        Hop::new(5, 6),
+        Hop::new(0, 0),
+        Hop::new(1, 1),
+    ];
+    v.sort();
+    let sorted: Vec<Range<usize>> = v.iter().map(|r| r.to_range()).collect();
+    assert_eq!(sorted, vec![0..0, 1..1, 1..3, 5..6, 5..9]);
 }
 
 #[test]
-fn test_try_new_empty_range() {
-    let r = SmallRange::<u32>::try_new(10, 10);
-    assert!(r.is_some());
-    assert!(r.unwrap().is_empty());
+fn copy_semantics() {
+    let a = Hop::new(1, 2);
+    let b = a;
+    assert_eq!(a, b);
 }
 
 #[test]
-fn test_try_new_invalid_start_exceeds_end() {
-    let r = SmallRange::<u32>::try_new(20, 10);
-    assert!(r.is_none());
+fn iteration_by_value_and_by_ref() {
+    let r = Hop::new(5, 8);
+    assert_eq!(r.into_iter().collect::<Vec<_>>(), vec![5, 6, 7]);
+    assert_eq!((&r).into_iter().collect::<Vec<_>>(), vec![5, 6, 7]);
+    let mut seen = Vec::new();
+    for i in &r {
+        seen.push(i);
+    }
+    for i in r {
+        seen.push(i);
+    }
+    assert_eq!(seen, vec![5, 6, 7, 5, 6, 7]);
+    assert!(Hop::new(3, 3).into_iter().next().is_none());
+    assert_eq!(r.into_iter().len(), 3);
 }
 
 #[test]
-fn test_try_new_start_exceeds_capacity() {
-    // u16 max start is 254 (LOW_MASK - 1 = 255 - 1)
-    let r = SmallRange::<u16>::try_new(255, 255);
-    assert!(r.is_none());
-
-    // 254 should work
-    let r = SmallRange::<u16>::try_new(254, 254);
-    assert!(r.is_some());
+#[allow(clippy::reversed_empty_ranges)]
+fn conversions_with_std_range() {
+    let std: Range<usize> = Hop::new(2, 4).into();
+    assert_eq!(std, 2..4);
+    assert_eq!(Hop::try_from(2..4), Ok(Hop::new(2, 4)));
+    assert_eq!(
+        Hop::try_from(9..3),
+        Err(OutOfRange {
+            start: 9,
+            end: 3,
+            max_start: Hop::MAX_START,
+            max_len: Hop::MAX_LEN
+        })
+    );
+    assert_eq!(
+        Hop::try_from(0..1000),
+        Err(OutOfRange {
+            start: 0,
+            end: 1000,
+            max_start: Hop::MAX_START,
+            max_len: 254
+        })
+    );
 }
 
 #[test]
-fn test_try_new_length_exceeds_capacity() {
-    // u16 max length is 254
-    let r = SmallRange::<u16>::try_new(0, 255);
-    assert!(r.is_none());
+fn indexes_slices_arrays_and_str() {
+    let data = [10, 11, 12, 13, 14];
+    let r = Hop::new(1, 4);
+    assert_eq!(&data[r], &[11, 12, 13]);
+    assert_eq!(&data[..][r], &[11, 12, 13]);
 
-    // 254 should work
-    let r = SmallRange::<u16>::try_new(0, 254);
-    assert!(r.is_some());
+    let mut buf = [0u8; 5];
+    buf[..][r].fill(7);
+    assert_eq!(buf, [0, 7, 7, 7, 0]);
+
+    let s = "hello world";
+    assert_eq!(&s[Hop::new(6, 11)], "world");
+    let mut bytes = *b"hello";
+    let text = core::str::from_utf8_mut(&mut bytes).unwrap();
+    text[Hop::new(0, 1)].make_ascii_uppercase();
+    assert_eq!(text, "Hello");
 }
 
-// =============================================================================
-// contains() Tests
-// =============================================================================
-
+#[cfg(feature = "alloc")]
 #[test]
-fn test_contains_basic() {
-    let r = SmallRange::<u32>::new(5, 10);
+fn indexes_vec_and_string() {
+    let r = Hop::new(1, 4);
+    let mut v: Vec<u8> = vec![0; 5];
+    v[r].fill(7);
+    assert_eq!(&v[r], &[7, 7, 7]);
+    assert_eq!(v, vec![0, 7, 7, 7, 0]);
 
-    // Values inside range
-    assert!(r.contains(5)); // start is included
-    assert!(r.contains(6));
-    assert!(r.contains(9)); // last value before end
-
-    // Values outside range
-    assert!(!r.contains(4)); // before start
-    assert!(!r.contains(10)); // end is excluded
-    assert!(!r.contains(11)); // after end
+    let mut owned = String::from("hello");
+    owned[Hop::new(0, 1)].make_ascii_uppercase();
+    assert_eq!(&owned[Hop::new(0, 2)], "He");
+    assert_eq!(owned, "Hello");
 }
 
 #[test]
-fn test_contains_empty_range() {
-    let r = SmallRange::<u32>::new(5, 5);
+#[should_panic]
+fn indexing_out_of_bounds_panics() {
+    let data = [1, 2, 3];
+    let _ = &data[Hop::new(1, 5)];
+}
+
+#[test]
+fn contains() {
+    let r = R32::new(5, 10);
+    assert!(r.contains(5));
+    assert!(r.contains(9));
     assert!(!r.contains(4));
-    assert!(!r.contains(5)); // empty range contains nothing
-    assert!(!r.contains(6));
+    assert!(!r.contains(10));
+    assert!(!r.contains(usize::MAX));
+    assert!(!R32::new(5, 5).contains(5));
+    assert!(R32::new(0, 1).contains(0));
 }
 
 #[test]
-fn test_contains_single_element() {
-    let r = SmallRange::<u32>::new(42, 43);
-    assert!(!r.contains(41));
-    assert!(r.contains(42));
-    assert!(!r.contains(43));
+fn overlaps() {
+    let a = R32::new(0, 10);
+    let b = R32::new(5, 15);
+    let c = R32::new(10, 20);
+    let empty = R32::new(5, 5);
+    assert!(a.overlaps(b) && b.overlaps(a));
+    assert!(!a.overlaps(c) && !c.overlaps(a));
+    assert!(b.overlaps(c));
+    assert!(a.overlaps(a));
+    assert!(!empty.overlaps(a) && !a.overlaps(empty) && !empty.overlaps(empty));
+    assert!(R32::new(0, 100).overlaps(R32::new(25, 75)));
 }
 
 #[test]
-fn test_contains_zero_start() {
-    let r = SmallRange::<u32>::new(0, 5);
-    assert!(r.contains(0));
-    assert!(r.contains(4));
-    assert!(!r.contains(5));
+fn methods_work_through_references() {
+    let r = Hop::new(1, 3);
+    let by_ref = &r;
+    assert_eq!(by_ref.start(), 1);
+    assert_eq!(by_ref.len(), 2);
+    assert!(!by_ref.is_empty());
+    let opt = Some(r);
+    assert!(opt.as_ref().is_some_and(|r| r.contains(2)));
 }
 
 // =============================================================================
-// overlaps() Tests
-// =============================================================================
-
-#[test]
-fn test_overlaps_basic() {
-    let a = SmallRange::<u32>::new(0, 10);
-    let b = SmallRange::<u32>::new(5, 15);
-    let c = SmallRange::<u32>::new(10, 20);
-    let d = SmallRange::<u32>::new(20, 30);
-
-    // a and b overlap at 5..10
-    assert!(a.overlaps(&b));
-    assert!(b.overlaps(&a)); // symmetric
-
-    // a ends where c starts - no overlap
-    assert!(!a.overlaps(&c));
-    assert!(!c.overlaps(&a));
-
-    // b and c overlap at 10..15
-    assert!(b.overlaps(&c));
-    assert!(c.overlaps(&b));
-
-    // a and d are far apart
-    assert!(!a.overlaps(&d));
-    assert!(!d.overlaps(&a));
-}
-
-#[test]
-fn test_overlaps_adjacent() {
-    let a = SmallRange::<u32>::new(0, 10);
-    let b = SmallRange::<u32>::new(10, 20);
-
-    // Adjacent ranges don't overlap (a.end == b.start but end is exclusive)
-    assert!(!a.overlaps(&b));
-    assert!(!b.overlaps(&a));
-}
-
-#[test]
-fn test_overlaps_contained() {
-    let outer = SmallRange::<u32>::new(0, 100);
-    let inner = SmallRange::<u32>::new(25, 75);
-
-    // Contained ranges overlap
-    assert!(outer.overlaps(&inner));
-    assert!(inner.overlaps(&outer));
-}
-
-#[test]
-fn test_overlaps_identical() {
-    let a = SmallRange::<u32>::new(10, 20);
-    let b = SmallRange::<u32>::new(10, 20);
-
-    // Identical non-empty ranges overlap
-    assert!(a.overlaps(&b));
-}
-
-#[test]
-fn test_overlaps_empty_range() {
-    let empty = SmallRange::<u32>::new(10, 10);
-    let normal = SmallRange::<u32>::new(5, 15);
-
-    // Empty range doesn't overlap with anything
-    assert!(!empty.overlaps(&normal));
-    assert!(!normal.overlaps(&empty));
-
-    // Empty range doesn't even overlap with itself
-    assert!(!empty.overlaps(&empty));
-}
-
-#[test]
-fn test_overlaps_single_point_shared() {
-    // These share the point at position 10
-    let a = SmallRange::<u32>::new(5, 11);
-    let b = SmallRange::<u32>::new(10, 15);
-
-    assert!(a.overlaps(&b));
-    assert!(b.overlaps(&a));
-}
-
-// =============================================================================
-// Panic Tests (debug assertions only)
-// =============================================================================
-
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "start must not exceed end")]
-fn test_new_panics_on_invalid_range() {
-    SmallRange::<u32>::new(20, 10);
-}
-
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "start+1 exceeds half-width capacity")]
-fn test_new_panics_on_start_overflow() {
-    SmallRange::<u16>::new(255, 255);
-}
-
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "length+1 exceeds half-width capacity")]
-fn test_new_panics_on_length_overflow() {
-    SmallRange::<u16>::new(0, 255);
-}
-
-// =============================================================================
-// Property-Based Tests
+// Property-based
 // =============================================================================
 
 mod proptest_tests {
@@ -496,75 +462,101 @@ mod proptest_tests {
 
     proptest! {
         #[test]
-        fn roundtrip_u32(start in 0u32..65000, len in 0u32..65000) {
-            let end = start.saturating_add(len).min(65534);
-            let len = end - start;
-
-            let range = SmallRange::<u32>::new(start, end);
-            prop_assert_eq!(range.start(), start);
-            prop_assert_eq!(range.end(), end);
-            prop_assert_eq!(range.len(), len as usize);
+        fn roundtrip_hop(start in 0usize..=Hop::MAX_START, len in 0usize..=Hop::MAX_LEN) {
+            let r = Hop::new(start, start + len);
+            prop_assert_eq!(r.start(), start);
+            prop_assert_eq!(r.len(), len);
+            prop_assert_eq!(r.end(), start + len);
+            prop_assert_eq!(Hop::from_bits(r.to_bits()), Some(r));
         }
 
         #[test]
-        fn roundtrip_u64(start in 0u64..0xFFFF_0000u64, len in 0u64..0xFFFF_0000u64) {
-            let max = 0xFFFF_FFFEu64;
-            let end = start.saturating_add(len).min(max);
-            let len = end - start;
-
-            let range = SmallRange::<u64>::new(start, end);
-            prop_assert_eq!(range.start(), start);
-            prop_assert_eq!(range.end(), end);
-            prop_assert_eq!(range.len(), len as usize);
+        fn roundtrip_r64(start in 0usize..=R64::MAX_START, len in 0usize..=R64::MAX_LEN) {
+            let r = R64::new(start, start + len);
+            prop_assert_eq!(r.to_range(), start..start + len);
         }
 
         #[test]
-        fn try_new_never_panics(start in 0u64..=u64::MAX, end in 0u64..=u64::MAX) {
-            // try_new should never panic, just return None for invalid inputs
-            let _ = SmallRange::<u64>::try_new(start, end);
+        fn roundtrip_wide(start in 0usize..=Wide::MAX_START, len in 0usize..=Wide::MAX_LEN) {
+            let r = Wide::new(start, start + len);
+            prop_assert_eq!(r.to_range(), start..start + len);
         }
 
         #[test]
-        fn try_new_roundtrip(start in 0u32..65000, len in 0u32..65000) {
-            let end = start.saturating_add(len).min(65534);
+        fn try_new_never_panics(start in any::<usize>(), end in any::<usize>()) {
+            let _ = Hop::try_new(start, end);
+            let _ = R16::try_new(start, end);
+            let _ = R64::try_new(start, end);
+            let _ = SmallRange::<u64, 63>::try_new(start, end);
+        }
 
-            if let Some(range) = SmallRange::<u32>::try_new(start, end) {
-                prop_assert_eq!(range.start(), start);
-                prop_assert_eq!(range.end(), end);
+        #[test]
+        fn try_new_agrees_with_capacity(start in any::<usize>(), end in any::<usize>()) {
+            let fits = start <= end && start <= Hop::MAX_START && end - start <= Hop::MAX_LEN;
+            prop_assert_eq!(Hop::try_new(start, end).is_some(), fits);
+        }
+
+        #[test]
+        fn from_bits_accepts_exactly_valid_words(word in any::<u32>()) {
+            let valid = word & 0xFF != 0;
+            let r = Hop::from_bits(word);
+            prop_assert_eq!(r.is_some(), valid);
+            if let Some(r) = r {
+                prop_assert_eq!(r.to_bits(), word);
             }
         }
 
         #[test]
-        fn contains_matches_std_range(start in 0u32..1000, len in 0u32..1000, value in 0u32..2000) {
-            let end = start + len;
-            let small = SmallRange::<u32>::new(start, end);
-            let std_range = start..end;
-
-            prop_assert_eq!(small.contains(value), std_range.contains(&value));
+        fn contains_matches_std(start in 0usize..1000, len in 0usize..250, value in 0usize..2000) {
+            let r = Hop::new(start, start + len);
+            prop_assert_eq!(r.contains(value), (start..start + len).contains(&value));
         }
 
         #[test]
-        fn to_range_roundtrip(start in 0u32..65000, len in 0u32..65000) {
-            let end = start.saturating_add(len).min(65534);
-
-            let small = SmallRange::<u32>::new(start, end);
-            let std_range = small.to_range();
-
-            prop_assert_eq!(std_range.start, start);
-            prop_assert_eq!(std_range.end, end);
+        fn overlaps_is_symmetric(a in 0usize..500, la in 0usize..250, b in 0usize..500, lb in 0usize..250) {
+            let x = Hop::new(a, a + la);
+            let y = Hop::new(b, b + lb);
+            prop_assert_eq!(x.overlaps(y), y.overlaps(x));
         }
 
         #[test]
-        fn overlaps_is_symmetric(
-            start1 in 0u32..1000,
-            len1 in 0u32..1000,
-            start2 in 0u32..1000,
-            len2 in 0u32..1000
-        ) {
-            let a = SmallRange::<u32>::new(start1, start1 + len1);
-            let b = SmallRange::<u32>::new(start2, start2 + len2);
-
-            prop_assert_eq!(a.overlaps(&b), b.overlaps(&a));
+        fn ord_matches_tuple_order(a in 0usize..300, la in 0usize..250, b in 0usize..300, lb in 0usize..250) {
+            let x = Hop::new(a, a + la);
+            let y = Hop::new(b, b + lb);
+            prop_assert_eq!(x.cmp(&y), (a, la).cmp(&(b, lb)));
         }
+    }
+}
+
+// =============================================================================
+// serde
+// =============================================================================
+
+#[cfg(feature = "serde")]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn serializes_as_start_and_end() {
+        let json = serde_json::to_string(&Hop::new(3, 7)).unwrap();
+        assert_eq!(json, r#"{"start":3,"end":7}"#);
+        let back: Hop = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Hop::new(3, 7));
+    }
+
+    #[test]
+    fn deserialize_validates() {
+        let err = serde_json::from_str::<Hop>(r#"{"start":9,"end":3}"#).unwrap_err();
+        assert!(format!("{err}").contains("start exceeds end"), "{err}");
+        let err = serde_json::from_str::<Hop>(r#"{"start":0,"end":1000}"#).unwrap_err();
+        assert!(format!("{err}").contains("does not fit"), "{err}");
+    }
+
+    #[test]
+    fn option_roundtrip() {
+        let v: Vec<Option<Hop>> = vec![None, Some(Hop::default()), Some(Hop::new(1, 2))];
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Vec<Option<Hop>> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
     }
 }

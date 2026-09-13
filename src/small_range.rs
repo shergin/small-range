@@ -1,362 +1,540 @@
 use core::fmt;
 use core::hash::Hash;
 use core::num::NonZero;
-use core::ops::Range;
+use core::ops::{Index, IndexMut, Range};
 
-use num_traits::{AsPrimitive, PrimInt, Unsigned};
-
-/// Sealed trait module to prevent external implementations.
-mod private {
+mod sealed {
     pub trait Sealed {}
-    impl Sealed for u16 {}
-    impl Sealed for u32 {}
-    impl Sealed for u64 {}
-    impl Sealed for usize {}
 }
 
-/// Trait for types that can be used as storage in a `SmallRange`.
+/// Storage word of a [`SmallRange`].
 ///
-/// This trait is sealed and only implemented for `u16`, `u32`, `u64`, and `usize`.
-/// The storage type determines how much space the range uses and the maximum
-/// values for start and length (each limited to half the storage width minus 1).
+/// This trait is sealed and implemented for `u16`, `u32`, `u64` and `usize`.
+/// The storage type fixes the size of the range; together with `LEN_BITS` it
+/// fixes the capacity of the start and length fields.
+pub trait SmallRangeStorage: sealed::Sealed + Copy + Eq + Ord + Hash + 'static {
+    /// Width of the storage word in bits.
+    const BITS: u32;
+
+    #[doc(hidden)]
+    type NonZeroWord: Copy + Eq + Ord + Hash;
+    #[doc(hidden)]
+    fn to_u64(self) -> u64;
+    #[doc(hidden)]
+    fn from_u64_truncating(word: u64) -> Self;
+    #[doc(hidden)]
+    fn new_nonzero(word: Self) -> Option<Self::NonZeroWord>;
+    #[doc(hidden)]
+    /// # Safety
+    /// `word` must be nonzero.
+    unsafe fn new_nonzero_unchecked(word: Self) -> Self::NonZeroWord;
+    #[doc(hidden)]
+    fn get(nz: Self::NonZeroWord) -> Self;
+}
+
+macro_rules! impl_storage {
+    ($($S:ty),* $(,)?) => {$(
+        impl sealed::Sealed for $S {}
+
+        impl SmallRangeStorage for $S {
+            const BITS: u32 = <$S>::BITS;
+            type NonZeroWord = NonZero<$S>;
+
+            #[inline(always)]
+            fn to_u64(self) -> u64 {
+                self as u64
+            }
+
+            #[inline(always)]
+            fn from_u64_truncating(word: u64) -> Self {
+                word as $S
+            }
+
+            #[inline(always)]
+            fn new_nonzero(word: Self) -> Option<NonZero<$S>> {
+                NonZero::new(word)
+            }
+
+            #[inline(always)]
+            unsafe fn new_nonzero_unchecked(word: Self) -> NonZero<$S> {
+                // SAFETY: forwarded to the caller.
+                unsafe { NonZero::new_unchecked(word) }
+            }
+
+            #[inline(always)]
+            fn get(nz: NonZero<$S>) -> Self {
+                nz.get()
+            }
+        }
+    )*};
+}
+impl_storage!(u16, u32, u64, usize);
+
+/// A half-open range `start..end` packed into a single storage word.
 ///
-/// | Storage | Max Start | Max Length | Size     |
-/// |---------|-----------|------------|----------|
-/// | `u16`   | 254       | 254        | 2 bytes  |
-/// | `u32`   | 65,534    | 65,534     | 4 bytes  |
-/// | `u64`   | ~4.29B    | ~4.29B     | 8 bytes  |
-/// | `usize` | ~4.29B*   | ~4.29B*    | 8 bytes* |
+/// The low `LEN_BITS` bits hold `len + 1`; the remaining high bits hold
+/// `start`. Because the length field is never zero, the whole word is never
+/// zero, and `Option<SmallRange<..>>` is the same size as `SmallRange<..>`.
 ///
-/// *On 64-bit platforms. On 32-bit, same as u32.
-pub trait SmallRangeStorage:
-    private::Sealed + PrimInt + Unsigned + Hash + AsPrimitive<usize> + 'static
-where
-    usize: AsPrimitive<Self>,
-{
-    /// The NonZero wrapper for this storage type.
-    type NonZeroStorage: Copy + Eq + Hash;
+/// Bounds are `usize` on the API side regardless of the storage type, so the
+/// range can index slices directly.
+///
+/// # Choosing a split
+///
+/// | type | bytes | max start | max len |
+/// |------|-------|-----------|---------|
+/// | `SmallRange<u32, 8>`  | 4 | 16,777,215 | 254 |
+/// | `SmallRange<u32, 16>` | 4 | 65,535 | 65,534 |
+/// | `SmallRange<u64, 16>` | 8 | 2<sup>48</sup> − 1 | 65,534 |
+/// | `SmallRange<u64, 32>` | 8 | 2<sup>32</sup> − 1 | 2<sup>32</sup> − 2 |
+///
+/// `LEN_BITS` must be at least 1 and less than the storage width. Any other
+/// split is rejected at compile time:
+///
+/// ```compile_fail
+/// let r = small_range::SmallRange::<u32, 32>::new(0, 1);
+/// ```
+///
+/// # Ordering
+///
+/// The derived `Ord` compares the packed word, which orders ranges by start
+/// and then by length.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SmallRange<S: SmallRangeStorage, const LEN_BITS: u32> {
+    bits: S::NonZeroWord,
+}
 
-    /// Number of bits for each element (half of storage width).
-    const HALF_BITS: u32;
+/// Error returned when a range does not fit a [`SmallRange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutOfRange {
+    /// Requested start.
+    pub start: usize,
+    /// Requested end.
+    pub end: usize,
+    /// Largest start the target type can hold.
+    pub max_start: usize,
+    /// Largest length the target type can hold.
+    pub max_len: usize,
+}
 
-    /// Mask for extracting lower half (all bits set for half-width).
-    const LOW_MASK: Self;
+impl fmt::Display for OutOfRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.start > self.end {
+            write!(
+                f,
+                "invalid range {}..{}: start exceeds end",
+                self.start, self.end
+            )
+        } else {
+            write!(
+                f,
+                "range {}..{} does not fit: max start is {}, max length is {}",
+                self.start, self.end, self.max_start, self.max_len
+            )
+        }
+    }
+}
 
-    /// Create a NonZero from storage value.
+impl core::error::Error for OutOfRange {}
+
+impl<S: SmallRangeStorage, const LEN_BITS: u32> SmallRange<S, LEN_BITS> {
+    const VALID: () = assert!(
+        LEN_BITS >= 1 && LEN_BITS < S::BITS,
+        "SmallRange: LEN_BITS must be at least 1 and less than the storage width"
+    );
+
+    /// Number of bits holding the start.
+    pub const START_BITS: u32 = {
+        let () = Self::VALID;
+        S::BITS - LEN_BITS
+    };
+
+    const LEN_MASK: u64 = {
+        let () = Self::VALID;
+        (1u64 << LEN_BITS) - 1
+    };
+
+    /// Largest start this type can hold.
+    pub const MAX_START: usize = {
+        let raw = (1u64 << Self::START_BITS) - 1;
+        if raw > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            raw as usize
+        }
+    };
+
+    /// Largest length this type can hold. One value of the length field is
+    /// spent on the niche.
+    pub const MAX_LEN: usize = {
+        let raw = Self::LEN_MASK - 1;
+        if raw > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            raw as usize
+        }
+    };
+
+    #[inline(always)]
+    fn pack(start: usize, len: usize) -> S {
+        S::from_u64_truncating(((start as u64) << LEN_BITS) | (len as u64 + 1))
+    }
+
+    #[inline(always)]
+    fn word(self) -> u64 {
+        S::get(self.bits).to_u64()
+    }
+
+    /// Creates the range `start..end`, or `None` if it does not fit.
+    ///
+    /// Returns `None` when `start > end`, when `start > MAX_START`, or when
+    /// `end - start > MAX_LEN`. Compiles branch-free.
+    ///
+    /// ```
+    /// use small_range::SmallRange;
+    /// type R = SmallRange<u32, 8>;
+    ///
+    /// assert!(R::try_new(10, 20).is_some());
+    /// assert!(R::try_new(20, 10).is_none());      // start > end
+    /// assert!(R::try_new(0, 255).is_none());      // len 255 > MAX_LEN 254
+    /// assert!(R::try_new(1 << 24, 1 << 24).is_none()); // start > MAX_START
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn try_new(start: usize, end: usize) -> Option<Self> {
+        if start > end || start > Self::MAX_START || end - start > Self::MAX_LEN {
+            return None;
+        }
+        // The length field is in 1..=LEN_MASK, so the word is nonzero and
+        // `new_nonzero` never returns `None`; the compiler folds the check.
+        let bits = S::new_nonzero(Self::pack(start, end - start))?;
+        Some(Self { bits })
+    }
+
+    /// Creates the range `start..end`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start > end` or if either value exceeds the capacity of the
+    /// split, in debug and release builds alike.
+    ///
+    /// ```
+    /// use small_range::SmallRange;
+    /// let r = SmallRange::<u64, 32>::new(10, 20);
+    /// assert_eq!(r.to_range(), 10..20);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[track_caller]
+    pub fn new(start: usize, end: usize) -> Self {
+        match Self::try_new(start, end) {
+            Some(range) => range,
+            None => Self::out_of_range(start, end),
+        }
+    }
+
+    /// Creates the range `start..start + len`, or `None` if it does not fit.
+    #[inline]
+    #[must_use]
+    pub fn try_from_start_len(start: usize, len: usize) -> Option<Self> {
+        Self::try_new(start, start.checked_add(len)?)
+    }
+
+    /// Creates the range `start..start + len`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range does not fit, or if `start + len` overflows.
+    #[inline]
+    #[must_use]
+    #[track_caller]
+    pub fn from_start_len(start: usize, len: usize) -> Self {
+        match start.checked_add(len) {
+            Some(end) => Self::new(start, end),
+            None => panic!("SmallRange: start {start} + len {len} overflows usize"),
+        }
+    }
+
+    /// Creates the range `start..end` without checking that it fits.
     ///
     /// # Safety
-    /// The value must be non-zero.
-    unsafe fn new_nonzero_unchecked(val: Self) -> Self::NonZeroStorage;
-
-    /// Get the storage value from a NonZero.
-    fn get_nonzero(nz: Self::NonZeroStorage) -> Self;
-}
-
-impl SmallRangeStorage for u16 {
-    type NonZeroStorage = NonZero<u16>;
-    const HALF_BITS: u32 = 8;
-    const LOW_MASK: Self = 0xFF;
-
-    #[inline]
-    unsafe fn new_nonzero_unchecked(val: Self) -> Self::NonZeroStorage {
-        NonZero::new_unchecked(val)
-    }
-
-    #[inline]
-    fn get_nonzero(nz: Self::NonZeroStorage) -> Self {
-        nz.get()
-    }
-}
-
-impl SmallRangeStorage for u32 {
-    type NonZeroStorage = NonZero<u32>;
-    const HALF_BITS: u32 = 16;
-    const LOW_MASK: Self = 0xFFFF;
-
-    #[inline]
-    unsafe fn new_nonzero_unchecked(val: Self) -> Self::NonZeroStorage {
-        NonZero::new_unchecked(val)
-    }
-
-    #[inline]
-    fn get_nonzero(nz: Self::NonZeroStorage) -> Self {
-        nz.get()
-    }
-}
-
-impl SmallRangeStorage for u64 {
-    type NonZeroStorage = NonZero<u64>;
-    const HALF_BITS: u32 = 32;
-    const LOW_MASK: Self = 0xFFFF_FFFF;
-
-    #[inline]
-    unsafe fn new_nonzero_unchecked(val: Self) -> Self::NonZeroStorage {
-        NonZero::new_unchecked(val)
-    }
-
-    #[inline]
-    fn get_nonzero(nz: Self::NonZeroStorage) -> Self {
-        nz.get()
-    }
-}
-
-impl SmallRangeStorage for usize {
-    type NonZeroStorage = NonZero<usize>;
-    // On 64-bit: 32, on 32-bit: 16
-    const HALF_BITS: u32 = (core::mem::size_of::<usize>() * 8 / 2) as u32;
-    // On 64-bit: 0xFFFF_FFFF, on 32-bit: 0xFFFF
-    const LOW_MASK: Self = (1usize << Self::HALF_BITS) - 1;
-
-    #[inline]
-    unsafe fn new_nonzero_unchecked(val: Self) -> Self::NonZeroStorage {
-        NonZero::new_unchecked(val)
-    }
-
-    #[inline]
-    fn get_nonzero(nz: Self::NonZeroStorage) -> Self {
-        nz.get()
-    }
-}
-
-/// A compact range that packs start and length into a single storage value.
-///
-/// This type stores a range's start position and length in a single value,
-/// achieving 50% space savings compared to `Range<T>`. It also enables niche
-/// optimization so `Option<SmallRange<T>>` is the same size as `SmallRange<T>`.
-///
-/// # Type Parameters
-/// - `T`: The storage type (`u16`, `u32`, `u64`, or `usize`). Defaults to `u64`.
-///
-/// # Storage Layout
-/// - `SmallRange<u16>`: 2 bytes (vs 4 bytes for `Range<u16>`)
-/// - `SmallRange<u32>`: 4 bytes (vs 8 bytes for `Range<u32>`)
-/// - `SmallRange<u64>`: 8 bytes (vs 16 bytes for `Range<u64>`)
-/// - `SmallRange<usize>`: 8 bytes on 64-bit (vs 16 bytes for `Range<usize>`)
-///
-/// # Encoding
-/// Uses `(start+1, length+1)` encoding where start is in the high bits and
-/// length is in the low bits. Since both halves are always >= 1, the packed
-/// value is never zero, allowing `Option` to use 0 for `None`.
-///
-/// # Constraints
-/// - Start must not exceed end
-/// - Start and length must each fit in half the storage width minus 1
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SmallRange<T: SmallRangeStorage = u64>
-where
-    usize: AsPrimitive<T>,
-{
-    bits: T::NonZeroStorage,
-}
-
-impl<T: SmallRangeStorage> SmallRange<T>
-where
-    usize: AsPrimitive<T>,
-{
-    #[inline]
-    fn encode(start: T, end: T) -> T::NonZeroStorage {
-        debug_assert!(start <= end, "start must not exceed end");
-        let length = end - start;
-        // Add 1 to both, ensuring neither half is ever 0
-        let hi = start + T::one();
-        let lo = length + T::one();
-        debug_assert!(hi <= T::LOW_MASK, "start+1 exceeds half-width capacity");
-        debug_assert!(lo <= T::LOW_MASK, "length+1 exceeds half-width capacity");
-        let packed = (hi << T::HALF_BITS as usize) | lo;
-        // SAFETY: packed is NEVER zero because both hi >= 1 and lo >= 1
-        unsafe { T::new_nonzero_unchecked(packed) }
-    }
-
-    #[inline]
-    fn decode_start_length(bits: T::NonZeroStorage) -> (T, T) {
-        let packed = T::get_nonzero(bits);
-        let hi = packed >> T::HALF_BITS as usize;
-        let lo = packed & T::LOW_MASK;
-        let start = hi - T::one();
-        let length = lo - T::one();
-        (start, length)
-    }
-
-    /// Creates a new `SmallRange` with the given start and end values.
     ///
-    /// # Panics (debug only)
-    /// - If start exceeds end
-    /// - If start or length exceed the half-width capacity
+    /// `start <= end`, `start <= MAX_START` and `end - start <= MAX_LEN` must
+    /// all hold. Violating them produces a zero word, which is undefined
+    /// behavior for the `NonZero` inside. Prefer [`new`](Self::new); its
+    /// checks compile to three predictable branches.
     #[inline]
-    pub fn new(start: T, end: T) -> Self {
-        Self {
-            bits: Self::encode(start, end),
-        }
+    #[must_use]
+    pub unsafe fn new_unchecked(start: usize, end: usize) -> Self {
+        debug_assert!(
+            start <= end && start <= Self::MAX_START && end - start <= Self::MAX_LEN,
+            "SmallRange::new_unchecked called with an out-of-range value"
+        );
+        // SAFETY: the caller guarantees the bounds, so the length field is at
+        // least 1 and the packed word is nonzero.
+        let bits = unsafe { S::new_nonzero_unchecked(Self::pack(start, end - start)) };
+        Self { bits }
     }
 
-    /// Returns the start of the range.
-    #[inline]
-    pub fn start(&self) -> T {
-        let (start, _) = Self::decode_start_length(self.bits);
-        start
+    #[cold]
+    #[inline(never)]
+    #[track_caller]
+    fn out_of_range(start: usize, end: usize) -> ! {
+        panic!(
+            "{}: {}",
+            core::any::type_name::<Self>(),
+            OutOfRange {
+                start,
+                end,
+                max_start: Self::MAX_START,
+                max_len: Self::MAX_LEN,
+            }
+        )
     }
 
-    /// Returns the end of the range (exclusive).
+    /// Start of the range, inclusive.
     #[inline]
-    pub fn end(&self) -> T {
-        let (start, length) = Self::decode_start_length(self.bits);
-        start + length
+    #[must_use]
+    pub fn start(self) -> usize {
+        (self.word() >> LEN_BITS) as usize
     }
 
-    /// Returns the length of the range.
+    /// End of the range, exclusive.
     #[inline]
-    pub fn len(&self) -> usize {
-        let packed = T::get_nonzero(self.bits);
-        let lo = packed & T::LOW_MASK;
-        (lo - T::one()).as_()
+    #[must_use]
+    pub fn end(self) -> usize {
+        self.start() + self.len()
     }
 
-    /// Returns `true` if the range is empty.
+    /// Number of elements in the range.
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        let packed = T::get_nonzero(self.bits);
-        let lo = packed & T::LOW_MASK;
-        lo == T::one() // length + 1 == 1 means length == 0
+    #[must_use]
+    pub fn len(self) -> usize {
+        // The length field is at least 1, so subtracting before masking never
+        // borrows out of the field. Doing it in this order lets loops over
+        // `Option<SmallRange>` auto-vectorize.
+        ((self.word() - 1) & Self::LEN_MASK) as usize
     }
 
-    /// Converts the `SmallRange` to a standard `Range<T>`.
+    /// Whether the range contains no elements.
     #[inline]
-    pub fn to_range(&self) -> Range<T> {
-        let (start, length) = Self::decode_start_length(self.bits);
-        start..(start + length)
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.word() & Self::LEN_MASK == 1
     }
 
-    /// Creates a new `SmallRange` if the values are valid, returns `None` otherwise.
+    /// The equivalent standard range.
+    #[inline]
+    #[must_use]
+    pub fn to_range(self) -> Range<usize> {
+        let start = self.start();
+        start..start + self.len()
+    }
+
+    /// Whether `start <= value < end`.
     ///
-    /// Returns `None` if:
-    /// - `start > end`
-    /// - `start` or `length` exceed half-width capacity
-    ///
-    /// # Examples
     /// ```
     /// use small_range::SmallRange;
-    ///
-    /// // Valid range
-    /// assert!(SmallRange::<u32>::try_new(10, 20).is_some());
-    ///
-    /// // Invalid: start > end
-    /// assert!(SmallRange::<u32>::try_new(20, 10).is_none());
-    ///
-    /// // Invalid: values exceed capacity
-    /// assert!(SmallRange::<u16>::try_new(255, 300).is_none());
+    /// let r = SmallRange::<u32, 8>::new(5, 10);
+    /// assert!(r.contains(5));
+    /// assert!(r.contains(9));
+    /// assert!(!r.contains(10));
+    /// assert!(!r.contains(4));
     /// ```
     #[inline]
-    pub fn try_new(start: T, end: T) -> Option<Self> {
-        if start > end {
-            return None;
-        }
-        let length = end - start;
-        let hi = start + T::one();
-        let lo = length + T::one();
-        if hi > T::LOW_MASK || lo > T::LOW_MASK {
-            return None;
-        }
-        let packed = (hi << T::HALF_BITS as usize) | lo;
-        // SAFETY: packed is never zero because both hi >= 1 and lo >= 1
-        Some(Self {
-            bits: unsafe { T::new_nonzero_unchecked(packed) },
-        })
+    #[must_use]
+    pub fn contains(self, value: usize) -> bool {
+        value.wrapping_sub(self.start()) < self.len()
     }
 
-    /// Returns `true` if the range contains the given value.
+    /// Whether the two ranges share at least one element.
     ///
-    /// A value is contained if `start <= value < end`.
+    /// Empty ranges never overlap anything, including themselves.
     ///
-    /// # Examples
     /// ```
     /// use small_range::SmallRange;
-    ///
-    /// let range = SmallRange::<u32>::new(5, 10);
-    /// assert!(range.contains(5));   // start is included
-    /// assert!(range.contains(7));
-    /// assert!(!range.contains(10)); // end is excluded
-    /// assert!(!range.contains(4));
+    /// type R = SmallRange<u32, 8>;
+    /// assert!(R::new(0, 10).overlaps(R::new(5, 15)));
+    /// assert!(!R::new(0, 10).overlaps(R::new(10, 20)));
+    /// assert!(!R::new(5, 5).overlaps(R::new(0, 10)));
     /// ```
     #[inline]
-    pub fn contains(&self, value: T) -> bool {
-        value >= self.start() && value < self.end()
-    }
-
-    /// Returns `true` if this range overlaps with `other`.
-    ///
-    /// Two ranges overlap if they share at least one common value.
-    /// Empty ranges never overlap with anything (including themselves).
-    ///
-    /// # Examples
-    /// ```
-    /// use small_range::SmallRange;
-    ///
-    /// let a = SmallRange::<u32>::new(0, 10);
-    /// let b = SmallRange::<u32>::new(5, 15);
-    /// let c = SmallRange::<u32>::new(10, 20);
-    ///
-    /// assert!(a.overlaps(&b));   // overlap at 5..10
-    /// assert!(!a.overlaps(&c));  // a ends where c starts (no overlap)
-    /// assert!(b.overlaps(&c));   // overlap at 10..15
-    ///
-    /// // Empty ranges never overlap
-    /// let empty = SmallRange::<u32>::new(5, 5);
-    /// assert!(!empty.overlaps(&a));
-    /// ```
-    #[inline]
-    pub fn overlaps(&self, other: &Self) -> bool {
-        // Empty ranges never overlap with anything
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
         !self.is_empty()
             && !other.is_empty()
             && self.start() < other.end()
             && other.start() < self.end()
     }
+
+    /// The packed word. The encoding is part of the public API: the low
+    /// `LEN_BITS` bits hold `len + 1`, the high bits hold `start`.
+    ///
+    /// ```
+    /// use small_range::SmallRange;
+    /// assert_eq!(SmallRange::<u32, 8>::new(0, 0).to_bits(), 1);
+    /// assert_eq!(SmallRange::<u32, 8>::new(2, 5).to_bits(), (2 << 8) | 4);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn to_bits(self) -> S {
+        S::get(self.bits)
+    }
+
+    /// Rebuilds a range from a packed word, or `None` if the word is not a
+    /// valid encoding.
+    ///
+    /// ```
+    /// use small_range::SmallRange;
+    /// type R = SmallRange<u32, 8>;
+    /// let r = R::new(7, 9);
+    /// assert_eq!(R::from_bits(r.to_bits()), Some(r));
+    /// assert_eq!(R::from_bits(0), None);           // the niche
+    /// assert_eq!(R::from_bits(7 << 8), None);      // zero length field
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn from_bits(bits: S) -> Option<Self> {
+        let word = bits.to_u64();
+        let len_field = word & Self::LEN_MASK;
+        if len_field == 0 {
+            return None;
+        }
+        let start = word >> LEN_BITS;
+        let len = len_field - 1;
+        if start > Self::MAX_START as u64 || len > Self::MAX_LEN as u64 {
+            return None;
+        }
+        (start as usize).checked_add(len as usize)?;
+        let bits = S::new_nonzero(bits)?;
+        Some(Self { bits })
+    }
 }
 
-impl<T: SmallRangeStorage> Default for SmallRange<T>
-where
-    usize: AsPrimitive<T>,
-{
+impl<S: SmallRangeStorage, const LEN_BITS: u32> Default for SmallRange<S, LEN_BITS> {
+    /// The empty range `0..0`.
+    #[inline]
     fn default() -> Self {
-        Self::new(T::zero(), T::zero())
+        Self::new(0, 0)
     }
 }
 
-impl<T: SmallRangeStorage + fmt::Debug> fmt::Debug for SmallRange<T>
-where
-    usize: AsPrimitive<T>,
-{
+impl<S: SmallRangeStorage, const LEN_BITS: u32> fmt::Debug for SmallRange<S, LEN_BITS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SmallRange")
-            .field("start", &self.start())
-            .field("end", &self.end())
-            .finish()
+        write!(f, "{}..{}", self.start(), self.end())
     }
 }
 
-impl<T: SmallRangeStorage> IntoIterator for SmallRange<T>
-where
-    usize: AsPrimitive<T>,
-    Range<T>: Iterator<Item = T>,
-{
-    type Item = T;
-    type IntoIter = Range<T>;
+impl<S: SmallRangeStorage, const LEN_BITS: u32> IntoIterator for SmallRange<S, LEN_BITS> {
+    type Item = usize;
+    type IntoIter = Range<usize>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    #[inline]
+    fn into_iter(self) -> Range<usize> {
         self.to_range()
     }
 }
 
-impl<T: SmallRangeStorage> IntoIterator for &SmallRange<T>
-where
-    usize: AsPrimitive<T>,
-    Range<T>: Iterator<Item = T>,
-{
-    type Item = T;
-    type IntoIter = Range<T>;
+impl<S: SmallRangeStorage, const LEN_BITS: u32> IntoIterator for &SmallRange<S, LEN_BITS> {
+    type Item = usize;
+    type IntoIter = Range<usize>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    #[inline]
+    fn into_iter(self) -> Range<usize> {
         self.to_range()
+    }
+}
+
+impl<S: SmallRangeStorage, const LEN_BITS: u32> From<SmallRange<S, LEN_BITS>> for Range<usize> {
+    #[inline]
+    fn from(range: SmallRange<S, LEN_BITS>) -> Range<usize> {
+        range.to_range()
+    }
+}
+
+impl<S: SmallRangeStorage, const LEN_BITS: u32> TryFrom<Range<usize>> for SmallRange<S, LEN_BITS> {
+    type Error = OutOfRange;
+
+    #[inline]
+    fn try_from(range: Range<usize>) -> Result<Self, OutOfRange> {
+        Self::try_new(range.start, range.end).ok_or(OutOfRange {
+            start: range.start,
+            end: range.end,
+            max_start: Self::MAX_START,
+            max_len: Self::MAX_LEN,
+        })
+    }
+}
+
+impl<T, S: SmallRangeStorage, const LEN_BITS: u32> Index<SmallRange<S, LEN_BITS>> for [T] {
+    type Output = [T];
+
+    #[inline]
+    fn index(&self, range: SmallRange<S, LEN_BITS>) -> &[T] {
+        &self[range.to_range()]
+    }
+}
+
+impl<T, S: SmallRangeStorage, const LEN_BITS: u32> IndexMut<SmallRange<S, LEN_BITS>> for [T] {
+    #[inline]
+    fn index_mut(&mut self, range: SmallRange<S, LEN_BITS>) -> &mut [T] {
+        &mut self[range.to_range()]
+    }
+}
+
+impl<S: SmallRangeStorage, const LEN_BITS: u32> Index<SmallRange<S, LEN_BITS>> for str {
+    type Output = str;
+
+    #[inline]
+    fn index(&self, range: SmallRange<S, LEN_BITS>) -> &str {
+        &self[range.to_range()]
+    }
+}
+
+impl<S: SmallRangeStorage, const LEN_BITS: u32> IndexMut<SmallRange<S, LEN_BITS>> for str {
+    #[inline]
+    fn index_mut(&mut self, range: SmallRange<S, LEN_BITS>) -> &mut str {
+        &mut self[range.to_range()]
+    }
+}
+
+#[cfg(feature = "alloc")]
+mod alloc_impls {
+    use super::{SmallRange, SmallRangeStorage};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::ops::{Index, IndexMut};
+
+    impl<T, S: SmallRangeStorage, const LEN_BITS: u32> Index<SmallRange<S, LEN_BITS>> for Vec<T> {
+        type Output = [T];
+
+        #[inline]
+        fn index(&self, range: SmallRange<S, LEN_BITS>) -> &[T] {
+            &self[range.to_range()]
+        }
+    }
+
+    impl<T, S: SmallRangeStorage, const LEN_BITS: u32> IndexMut<SmallRange<S, LEN_BITS>> for Vec<T> {
+        #[inline]
+        fn index_mut(&mut self, range: SmallRange<S, LEN_BITS>) -> &mut [T] {
+            &mut self[range.to_range()]
+        }
+    }
+
+    impl<S: SmallRangeStorage, const LEN_BITS: u32> Index<SmallRange<S, LEN_BITS>> for String {
+        type Output = str;
+
+        #[inline]
+        fn index(&self, range: SmallRange<S, LEN_BITS>) -> &str {
+            &self[range.to_range()]
+        }
+    }
+
+    impl<S: SmallRangeStorage, const LEN_BITS: u32> IndexMut<SmallRange<S, LEN_BITS>> for String {
+        #[inline]
+        fn index_mut(&mut self, range: SmallRange<S, LEN_BITS>) -> &mut str {
+            &mut self[range.to_range()]
+        }
     }
 }
